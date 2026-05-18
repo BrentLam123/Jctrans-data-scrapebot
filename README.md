@@ -89,6 +89,48 @@ phải trên VM headless):
 python scraper.py --country Japan --no-headless
 ```
 
+### Chạy trên Microsoft Edge (attach vào session sẵn có) — khuyên dùng
+
+Cách này **tốt nhất**: mày tự mở Edge, tự login jctrans 1 lần, bot attach vào
+cửa sổ đó qua remote-debugging. Session là của *mày* nên không bao giờ bị
+"logged elsewhere" kick, không cần auto re-login, và mày thấy bot click chạy
+trực tiếp trên trình duyệt thật.
+
+1. Đóng hết các cửa sổ Edge đang mở trước (nếu không Edge sẽ ignore cờ
+   `--remote-debugging-port`).
+2. Mở Edge với cờ debug (PowerShell, tất cả 1 dòng):
+
+   ```powershell
+   & "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" `
+     --remote-debugging-port=9526 `
+     --user-data-dir="C:\edge_hpl" `
+     --disable-background-timer-throttling `
+     --disable-renderer-backgrounding `
+     --disable-backgrounding-occluded-windows
+   ```
+
+   Hoặc dán nguyên dòng vào shortcut target:
+
+   ```
+   "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --remote-debugging-port=9526 --user-data-dir="C:\edge_hpl" --disable-background-timer-throttling --disable-renderer-backgrounding --disable-backgrounding-occluded-windows
+   ```
+
+3. Trong Edge: vào jctrans.com, login 1 lần (Edge sẽ nhớ cookie ở `C:\edge_hpl`
+   nên lần sau không phải login lại).
+4. Mở 1 PowerShell mới, chạy bot:
+
+   ```powershell
+   python scraper.py --browser edge --attach 127.0.0.1:9526 --country Japan --max-companies 20
+   ```
+
+5. Bot sẽ mở các tab công ty NGAY TRONG cửa sổ Edge của mày, scrape, tự đóng
+   tab. Khi bot xong, Edge của mày **vẫn còn nguyên**, không bị quit.
+
+Tips:
+- Đừng đụng vào cửa sổ Edge khi bot đang chạy (đừng click chuyển tab thủ công).
+- Nếu lần sau muốn chạy tiếp, lặp lại bước 1-2 (Edge đã nhớ login).
+- Có thể chạy ẩn cửa sổ bằng cách thêm `--inprivate` (không khuyên — sẽ mất cookie).
+
 ## Cấu trúc cột Excel
 
 | Cột | Tên              | Ghi chú                                                |

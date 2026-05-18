@@ -141,9 +141,37 @@ def setup_logging(verbose: bool = False) -> None:
 # ──────────────────────────────────────────────────────────────────────────
 
 
-def make_driver(headless: bool = True, block_images: bool = True) -> WebDriver:
-    """Create a Chrome WebDriver. Headless by default (only supported mode on CI)."""
-    opts = Options()
+def make_driver(browser: str = "chrome", headless: bool = True,
+                block_images: bool = True, attach: str | None = None) -> WebDriver:
+    """Create a WebDriver.
+
+    Args:
+        browser: 'chrome' or 'edge'.
+        headless: only honoured when launching a fresh browser (ignored on attach).
+        block_images: only honoured on a fresh browser launch.
+        attach: ``host:port`` of an already-running browser to attach via the
+            remote-debugging protocol (e.g. '127.0.0.1:9526'). When given, the
+            bot does NOT spawn its own browser — it talks to the one the user
+            already opened. ``headless`` / ``block_images`` are ignored in this
+            mode because the user owns the launch flags.
+    """
+    if browser == "edge":
+        from selenium.webdriver.edge.options import Options as EdgeOptions
+        opts = EdgeOptions()
+    else:
+        opts = Options()
+
+    if attach:
+        opts.add_experimental_option("debuggerAddress", attach)
+        # Don't touch other args — user controls the browser
+        if browser == "edge":
+            driver = webdriver.Edge(options=opts)
+        else:
+            driver = webdriver.Chrome(options=opts)
+        driver.set_page_load_timeout(120)
+        return driver
+
+    # Fresh launch
     if headless:
         opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
@@ -153,10 +181,13 @@ def make_driver(headless: bool = True, block_images: bool = True) -> WebDriver:
     opts.add_argument("--lang=en-US")
     opts.add_argument("--disable-extensions")
     opts.add_argument("--disable-background-networking")
+    opts.add_argument("--disable-background-timer-throttling")
+    opts.add_argument("--disable-renderer-backgrounding")
+    opts.add_argument("--disable-backgrounding-occluded-windows")
     opts.add_argument("--disable-notifications")
-    opts.add_argument("--blink-settings=imagesEnabled=false" if block_images else "")
+    if block_images:
+        opts.add_argument("--blink-settings=imagesEnabled=false")
     opts.add_argument(f"--user-agent={DEFAULT_USER_AGENT}")
-    # Block images, plugins, etc. via prefs (works even when above flag is filtered)
     prefs: dict = {
         "profile.default_content_setting_values.notifications": 2,
         "credentials_enable_service": False,
@@ -166,12 +197,19 @@ def make_driver(headless: bool = True, block_images: bool = True) -> WebDriver:
         prefs["profile.managed_default_content_settings.images"] = 2
         prefs["profile.default_content_setting_values.plugins"] = 2
     opts.add_experimental_option("prefs", prefs)
-    chrome_bin = os.environ.get("CHROME_BIN")
-    if chrome_bin and Path(chrome_bin).exists():
-        opts.binary_location = chrome_bin
-    elif Path("/home/ubuntu/.local/bin/google-chrome").exists():
-        opts.binary_location = "/home/ubuntu/.local/bin/google-chrome"
-    driver = webdriver.Chrome(options=opts)
+
+    if browser == "edge":
+        edge_bin = os.environ.get("EDGE_BIN")
+        if edge_bin and Path(edge_bin).exists():
+            opts.binary_location = edge_bin
+        driver = webdriver.Edge(options=opts)
+    else:
+        chrome_bin = os.environ.get("CHROME_BIN")
+        if chrome_bin and Path(chrome_bin).exists():
+            opts.binary_location = chrome_bin
+        elif Path("/home/ubuntu/.local/bin/google-chrome").exists():
+            opts.binary_location = "/home/ubuntu/.local/bin/google-chrome"
+        driver = webdriver.Chrome(options=opts)
     driver.set_page_load_timeout(120)
     return driver
 
@@ -778,21 +816,32 @@ def _parse_current_tab(driver: WebDriver, country: str, url: str,
         logger.info("skip suspended/non-member: %s", url)
         return None
 
-    # Scroll to lazy-load Contact Us section (fast — images are blocked)
-    for y in (800, 2000, 4000, 6000):
-        driver.execute_script(f"window.scrollTo(0, {y});")
-        time.sleep(0.2)
-    driver.execute_script("window.scrollTo(0, 0);")
-    time.sleep(0.2)
+    # Jump straight to the bottom to trigger lazy-load (Vue IntersectionObserver).
+    # One big jump is much faster than multiple small scrolls and works just as
+    # well in practice — the contactCard WebDriverWait below catches the result.
+    driver.execute_script(
+        "window.scrollTo(0, document.body.scrollHeight);"
+    )
     close_blocking_overlays(driver)
 
-    # Wait briefly for the contactCard to render (it lazy-loads after scroll)
     try:
         WebDriverWait(driver, 6).until(
             lambda d: bool(d.find_elements(By.CSS_SELECTOR, "div.contactCard"))
         )
     except TimeoutException:
-        pass
+        # Fallback: try a couple of incremental scrolls in case the single jump
+        # didn't trigger the observer (some pages render only after a real
+        # scroll step).
+        for y in (1500, 4000, 6000):
+            driver.execute_script(f"window.scrollTo(0, {y});")
+            time.sleep(0.1)
+        try:
+            WebDriverWait(driver, 4).until(
+                lambda d: bool(d.find_elements(By.CSS_SELECTOR, "div.contactCard"))
+            )
+        except TimeoutException:
+            pass
+    driver.execute_script("window.scrollTo(0, 0);")
 
     info = CompanyInfo(country=country, url=url)
     info.company_name = extract_company_name(driver)
@@ -956,7 +1005,7 @@ def _close_extra_tabs(driver: WebDriver, keep_handle: str) -> None:
         pass
 
 
-def _open_urls_in_tabs(driver: WebDriver, urls: list[str], stagger: float = 0.15) -> list[str]:
+def _open_urls_in_tabs(driver: WebDriver, urls: list[str], stagger: float = 0.05) -> list[str]:
     """Open each URL in a new background tab, return the list of new handles in order."""
     before = set(driver.window_handles)
     for url in urls:
@@ -1215,6 +1264,16 @@ def main() -> int:
                         help="Disable tab-batching mode (visit detail pages one-by-one)")
     parser.add_argument("--tab-batch", type=int, default=20,
                         help="How many detail pages to open as tabs at once (default 20)")
+    parser.add_argument("--browser", choices=["chrome", "edge"], default="chrome",
+                        help="Which browser to drive (default: chrome)")
+    parser.add_argument(
+        "--attach", default=None,
+        help=(
+            "Attach to an already-running browser via remote-debugging-protocol, "
+            "format 'host:port' (e.g. '127.0.0.1:9526'). Use this to drive the "
+            "Edge / Chrome window you opened yourself — bot won't launch its own."
+        ),
+    )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -1225,14 +1284,27 @@ def main() -> int:
     wb, ws, next_row = open_or_create_workbook(excel_path)
     state = load_checkpoint()
 
-    driver = make_driver(headless=not args.no_headless)
+    driver = make_driver(
+        browser=args.browser,
+        headless=not args.no_headless,
+        attach=args.attach,
+    )
+    attached = bool(args.attach)
+    if attached:
+        logger.info("attached to existing %s at %s", args.browser, args.attach)
 
     def save() -> None:
         wb.save(excel_path)
         save_checkpoint(state)
 
     try:
-        login(driver, LOGIN_EMAIL, LOGIN_PASSWORD)
+        # When attached to user's browser, do not force navigation /
+        # credential fill — just check, and only run login() if SIGN IN is
+        # actually visible (so we don't disturb a working session).
+        if attached:
+            ensure_logged_in(driver, LOGIN_EMAIL, LOGIN_PASSWORD, navigate_first=True)
+        else:
+            login(driver, LOGIN_EMAIL, LOGIN_PASSWORD)
 
         if args.country:
             countries = args.country
@@ -1276,10 +1348,28 @@ def main() -> int:
             save_checkpoint(state)
         except Exception:
             pass
-        try:
-            driver.quit()
-        except Exception:
-            pass
+        if not attached:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+        else:
+            # Detach without killing the user's browser
+            try:
+                # Best-effort: close every tab we opened, leaving the
+                # browser session alive for the user.
+                main_handle = driver.current_window_handle
+                for h in list(driver.window_handles):
+                    if h == main_handle:
+                        continue
+                    try:
+                        driver.switch_to.window(h)
+                        driver.close()
+                    except Exception:
+                        pass
+                driver.switch_to.window(main_handle)
+            except Exception:
+                pass
 
     logger.info("done — wrote %s", excel_path)
     return 0
