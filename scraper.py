@@ -534,9 +534,39 @@ def click_search(driver: WebDriver) -> None:
 
 
 def collect_company_urls(driver: WebDriver) -> list[str]:
-    cards = driver.find_elements(By.CSS_SELECTOR, "ul.membership-list-content-center-list > li")
+    """Collect company detail URLs from the current results page.
+
+    Uses a single ``execute_script`` call so the result is plain strings —
+    no WebElement references can go stale between the iteration and the
+    href read. Vue can re-render the list at any time (especially right
+    after we close a big batch of child tabs), which used to crash this
+    function with StaleElementReferenceException.
+    """
+    try:
+        result = driver.execute_script(
+            "const out = [];"
+            "const seen = new Set();"
+            "const links = document.querySelectorAll("
+            "  'ul.membership-list-content-center-list > li a[href*=\"/en/company/\"]'"
+            ");"
+            "for (const a of links) {"
+            "  const h = a.href;"
+            "  if (h && !seen.has(h)) { seen.add(h); out.push(h); }"
+            "}"
+            "return out;"
+        )
+        return list(result or [])
+    except Exception as exc:
+        logger.warning("collect_company_urls JS path failed: %s — falling back", exc)
+    # Fallback: WebElement-based, with stale guards.
     urls: list[str] = []
     seen: set[str] = set()
+    try:
+        cards = driver.find_elements(
+            By.CSS_SELECTOR, "ul.membership-list-content-center-list > li"
+        )
+    except Exception:
+        return urls
     for card in cards:
         try:
             link = card.find_element(By.CSS_SELECTOR, "a[href*='/en/company/']")
@@ -544,53 +574,220 @@ def collect_company_urls(driver: WebDriver) -> list[str]:
             if href and href not in seen:
                 seen.add(href)
                 urls.append(href)
-        except NoSuchElementException:
+        except (NoSuchElementException, StaleElementReferenceException):
             continue
     return urls
 
 
-def click_next_page(driver: WebDriver) -> bool:
-    """Click the pagination 'next' button. Return False if there is no next page."""
-    next_btns = driver.find_elements(By.CSS_SELECTOR, "button.btn-next")
-    for btn in next_btns:
+def _current_page_num(driver: WebDriver) -> str:
+    """Return the active page number text from el-pagination, or '' if not found."""
+    for sel in (
+        "ul.el-pager li.is-active",
+        "ul.el-pager li.active",
+        ".el-pagination li.number.active",
+    ):
         try:
-            if not btn.is_displayed():
+            for el in driver.find_elements(By.CSS_SELECTOR, sel):
+                t = (el.text or "").strip()
+                if t:
+                    return t
+        except Exception:
+            pass
+    return ""
+
+
+def _first_card_href(driver: WebDriver) -> str:
+    """Return the href of the first company card link, or ''.
+
+    Uses a JS lookup so it never raises StaleElementReferenceException.
+    """
+    try:
+        result = driver.execute_script(
+            "const a = document.querySelector("
+            "  'ul.membership-list-content-center-list > li a[href*=\"/en/company/\"]'"
+            ");"
+            "return a ? a.href : '';"
+        )
+        return result or ""
+    except Exception:
+        return ""
+
+
+def _all_card_hrefs(driver: WebDriver) -> list[str]:
+    """Return *all* current card hrefs (used to detect real list change)."""
+    try:
+        result = driver.execute_script(
+            "return Array.from(document.querySelectorAll("
+            "  'ul.membership-list-content-center-list > li a[href*=\"/en/company/\"]'"
+            ")).map(a => a.href);"
+        )
+        return list(result or [])
+    except Exception:
+        return []
+
+
+def _find_enabled_next_btn(driver: WebDriver) -> WebElement | None:
+    """Return a fresh, enabled .btn-next element (or None)."""
+    for b in driver.find_elements(By.CSS_SELECTOR, "button.btn-next"):
+        try:
+            if b.get_attribute("disabled"):
                 continue
-            disabled = btn.get_attribute("disabled")
-            cls = btn.get_attribute("class") or ""
-            if disabled or "is-disabled" in cls:
-                logger.info("next page button disabled — last page reached")
+            cls = b.get_attribute("class") or ""
+            if "is-disabled" in cls:
+                continue
+            return b
+        except StaleElementReferenceException:
+            continue
+    return None
+
+
+def _next_btn_state(driver: WebDriver) -> str:
+    """Return 'enabled' | 'disabled' | 'missing' — uses fresh lookup each call."""
+    btns = driver.find_elements(By.CSS_SELECTOR, "button.btn-next")
+    if not btns:
+        return "missing"
+    enabled = False
+    for b in btns:
+        try:
+            cls = b.get_attribute("class") or ""
+            disabled = b.get_attribute("disabled")
+            if not disabled and "is-disabled" not in cls:
+                enabled = True
+                break
+        except StaleElementReferenceException:
+            continue
+    return "enabled" if enabled else "disabled"
+
+
+def _page_num_int(driver: WebDriver) -> int | None:
+    try:
+        return int(_current_page_num(driver) or "")
+    except (ValueError, TypeError):
+        return None
+
+
+def _click_next_page_inner(driver: WebDriver) -> bool:
+    # Make sure pagination is in viewport.
+    try:
+        driver.execute_script(
+            "const b = document.querySelector('button.btn-next');"
+            "if (b) b.scrollIntoView({block:'center'});"
+        )
+    except Exception:
+        pass
+
+    # Wait for at least one .btn-next to be present (Vue may re-render briefly).
+    try:
+        WebDriverWait(driver, 10).until(
+            lambda d: bool(d.find_elements(By.CSS_SELECTOR, "button.btn-next"))
+        )
+    except TimeoutException:
+        logger.info("no .btn-next found in DOM — assuming single-page result")
+        return False
+
+    state = _next_btn_state(driver)
+    if state == "missing":
+        return False
+    if state == "disabled":
+        logger.info("next page button disabled — last page reached")
+        return False
+
+    num_before = _page_num_int(driver)
+    hrefs_before = set(_all_card_hrefs(driver))
+    logger.info(
+        "pagination: clicking next (current page=%s, cards=%s)",
+        num_before, len(hrefs_before),
+    )
+
+    def _advanced(d: WebDriver) -> bool:
+        """Return True only when *both* the page number and the card list
+        have moved forward.
+
+        Element UI updates ``el-pager`` immediately on click, but the
+        actual card list comes from an async API call, so the two are not
+        atomic. We must wait until the cards are *different* — otherwise
+        we'll proceed and read stale URLs.
+        """
+        try:
+            new_num = _page_num_int(d)
+            new_hrefs = _all_card_hrefs(d)
+            if not new_hrefs:
                 return False
-            # Snapshot the first card href so we can wait until the list refreshes
-            first_href_before = ""
+            new_set = set(new_hrefs)
+            # If we know the page number, demand it advanced.
+            if num_before is not None and new_num is not None:
+                if new_num <= num_before:
+                    return False
+            # And demand a real card change (at least one new href).
+            if hrefs_before and new_set == hrefs_before:
+                return False
+            if hrefs_before and new_set.issubset(hrefs_before):
+                return False
+            return True
+        except StaleElementReferenceException:
+            return False
+
+    # Click — JS click + always re-find the button (avoid holding a stale ref)
+    for attempt in (1, 2):
+        btn = _find_enabled_next_btn(driver)
+        if btn is None:
+            logger.info("next-page button vanished before click — assume done")
+            return False
+        try:
+            driver.execute_script("arguments[0].click();", btn)
+        except StaleElementReferenceException:
+            # Re-find and try once more
+            btn = _find_enabled_next_btn(driver)
+            if btn is None:
+                return False
             try:
-                first_link = driver.find_element(
+                driver.execute_script("arguments[0].click();", btn)
+            except Exception as exc:
+                logger.warning("retry click failed: %s", exc)
+        try:
+            WebDriverWait(driver, 35).until(_advanced)
+        except TimeoutException:
+            if attempt == 1:
+                logger.warning(
+                    "next-page click did not produce a change in 35s — retrying"
+                )
+                continue
+            logger.error(
+                "next-page transition still failing after retry — giving up on pagination"
+            )
+            return False
+        # Got an advance — wait for the new card list to render.
+        try:
+            WebDriverWait(driver, 15).until(
+                lambda d: bool(d.find_elements(
                     By.CSS_SELECTOR,
                     "ul.membership-list-content-center-list > li a[href*='/en/company/']",
-                )
-                first_href_before = first_link.get_attribute("href") or ""
-            except NoSuchElementException:
-                pass
-            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
-            driver.execute_script("arguments[0].click();", btn)
-            try:
-                WebDriverWait(driver, 25).until(
-                    lambda d: (
-                        (lambda links: bool(links) and (links[0].get_attribute("href") or "") != first_href_before)(
-                            d.find_elements(
-                                By.CSS_SELECTOR,
-                                "ul.membership-list-content-center-list > li a[href*='/en/company/']",
-                            )
-                        )
-                    )
-                )
-            except TimeoutException:
-                logger.warning("timeout waiting for next page to refresh")
-            return True
-        except Exception as exc:
-            logger.warning("error clicking next page: %s", exc)
-            return False
+                ))
+            )
+        except TimeoutException:
+            logger.warning("page transition detected but cards never re-rendered")
+        num_after = _page_num_int(driver)
+        href_after = _first_card_href(driver)
+        logger.info(
+            "pagination: advanced to page=%s, first href=%s",
+            num_after, href_after.rsplit("/", 1)[-1] if href_after else None,
+        )
+        return True
     return False
+
+
+def click_next_page(driver: WebDriver) -> bool:
+    """Click the pagination 'next' button.
+
+    Always returns a bool — never raises. False means 'no more pages' / 'gave
+    up'. True means 'now on a new page with cards rendered'.
+    """
+    try:
+        return _click_next_page_inner(driver)
+    except Exception as exc:
+        logger.error("click_next_page crashed: %s", exc)
+        logger.debug(traceback.format_exc())
+        return False
 
 
 # ──────────────────────────────────────────────────────────────────────────
