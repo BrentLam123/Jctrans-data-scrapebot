@@ -244,6 +244,35 @@ def click_confirm_logged_elsewhere(driver: WebDriver) -> bool:
     return False
 
 
+def is_logged_in(driver: WebDriver) -> bool:
+    """Detect login state. A visible SIGN IN button means we are logged out."""
+    try:
+        for b in driver.find_elements(By.CSS_SELECTOR, "button.login-btn"):
+            try:
+                if b.is_displayed():
+                    return False
+            except StaleElementReferenceException:
+                continue
+    except Exception:
+        pass
+    return True
+
+
+def ensure_logged_in(driver: WebDriver, email: str, password: str,
+                     navigate_first: bool = False) -> bool:
+    """If logged out, run login(). Returns True if a re-login actually happened."""
+    if navigate_first:
+        safe_get(driver, DIRECTORY_URL, settle=2)
+    # Dismiss any "logged elsewhere" / blocking popup before checking
+    click_confirm_logged_elsewhere(driver)
+    close_blocking_overlays(driver)
+    if is_logged_in(driver):
+        return False
+    logger.warning("session lost — re-logging in")
+    login(driver, email, password)
+    return True
+
+
 def login(driver: WebDriver, email: str, password: str) -> None:
     """Open directory page, open Sign-In dialog, fill credentials, submit."""
     safe_get(driver, DIRECTORY_URL, settle=6)
@@ -722,12 +751,16 @@ def extract_contacts(driver: WebDriver) -> list[ContactInfo]:
     return contacts
 
 
-def parse_company(driver: WebDriver, country: str, url: str) -> CompanyInfo | None:
-    """Visit detail page, parse and return CompanyInfo, or None if suspended."""
-    safe_get(driver, url, settle=1)
+def _parse_current_tab(driver: WebDriver, country: str, url: str,
+                       wait_secs: int = 25) -> CompanyInfo | None:
+    """Parse the detail page that is already loaded in the current tab.
+
+    Does NOT call driver.get(). Returns None if the company is suspended /
+    non-member.
+    """
     # Wait for the company-name <p> to appear so we don't sleep blindly
     try:
-        WebDriverWait(driver, 20).until(
+        WebDriverWait(driver, wait_secs).until(
             lambda d: bool(
                 d.find_elements(By.XPATH, "//main//p[contains(@class,'font-bold')]")
             )
@@ -772,6 +805,12 @@ def parse_company(driver: WebDriver, country: str, url: str) -> CompanyInfo | No
     info.air_freight = extract_chips(driver, "Air Freight Advantageous")
     info.contacts = extract_contacts(driver)
     return info
+
+
+def parse_company(driver: WebDriver, country: str, url: str) -> CompanyInfo | None:
+    """Visit detail page in the current tab and parse it."""
+    safe_get(driver, url, settle=1)
+    return _parse_current_tab(driver, country, url)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -873,6 +912,7 @@ def collect_all_urls_for_country(driver: WebDriver, country: str,
     """
     safe_get(driver, DIRECTORY_URL, settle=2)
     close_blocking_overlays(driver)
+    ensure_logged_in(driver, LOGIN_EMAIL, LOGIN_PASSWORD)
     if not select_country(driver, country):
         logger.warning("could not select country %r — skipping", country)
         return []
@@ -900,15 +940,233 @@ def collect_all_urls_for_country(driver: WebDriver, country: str,
     return all_urls
 
 
+def _close_extra_tabs(driver: WebDriver, keep_handle: str) -> None:
+    """Close every tab except ``keep_handle`` and switch back to it."""
+    for h in list(driver.window_handles):
+        if h == keep_handle:
+            continue
+        try:
+            driver.switch_to.window(h)
+            driver.close()
+        except Exception:
+            pass
+    try:
+        driver.switch_to.window(keep_handle)
+    except Exception:
+        pass
+
+
+def _open_urls_in_tabs(driver: WebDriver, urls: list[str], stagger: float = 0.15) -> list[str]:
+    """Open each URL in a new background tab, return the list of new handles in order."""
+    before = set(driver.window_handles)
+    for url in urls:
+        driver.execute_script("window.open(arguments[0], '_blank');", url)
+        if stagger:
+            time.sleep(stagger)
+    # Wait until all tabs are present
+    try:
+        WebDriverWait(driver, 15).until(
+            lambda d: len(set(d.window_handles) - before) >= len(urls)
+        )
+    except TimeoutException:
+        logger.warning(
+            "opened only %s/%s tabs", len(set(driver.window_handles) - before), len(urls)
+        )
+    # Preserve the order in which they were opened
+    new_handles: list[str] = []
+    seen = set(before)
+    for h in driver.window_handles:
+        if h not in seen:
+            new_handles.append(h)
+            seen.add(h)
+    return new_handles
+
+
+def _open_country_results(driver: WebDriver, country: str,
+                          email: str, password: str) -> bool:
+    """Navigate to the directory, ensure logged-in, select country and click search."""
+    safe_get(driver, DIRECTORY_URL, settle=2)
+    close_blocking_overlays(driver)
+    ensure_logged_in(driver, email, password, navigate_first=False)
+    if not select_country(driver, country):
+        logger.warning("could not select country %r — skipping", country)
+        return False
+    click_search(driver)
+    return True
+
+
+def _scrape_page_tabs(driver: WebDriver, country: str, urls: list[str],
+                      main_handle: str,
+                      tab_batch: int = 20) -> tuple[list[CompanyInfo], bool]:
+    """Open ``urls`` as tabs (in batches of ``tab_batch``), scrape and close.
+
+    Returns ``(results, session_lost)``. If ``session_lost`` is True, the caller
+    must throw away the partial results, re-login and retry the page.
+    """
+    results: list[CompanyInfo] = []
+    session_lost = False
+    for start in range(0, len(urls), tab_batch):
+        batch = urls[start:start + tab_batch]
+        logger.info("opening %s tabs (%s..%s of %s)",
+                    len(batch), start + 1, start + len(batch), len(urls))
+        new_handles = _open_urls_in_tabs(driver, batch)
+        for h, url in zip(new_handles, batch):
+            try:
+                driver.switch_to.window(h)
+            except Exception as exc:
+                logger.warning("could not switch to tab for %s: %s", url, exc)
+                continue
+            # Detect session loss BEFORE wasting time parsing masked data
+            if not is_logged_in(driver):
+                logger.warning("logged out (detected on %s) — aborting batch", url)
+                session_lost = True
+                try:
+                    driver.close()
+                except Exception:
+                    pass
+                continue
+            try:
+                info = _parse_current_tab(driver, country, url)
+            except Exception as exc:
+                logger.error("error parsing %s: %s", url, exc)
+                logger.debug(traceback.format_exc())
+                info = None
+            finally:
+                try:
+                    driver.close()
+                except Exception:
+                    pass
+            if info is not None:
+                results.append(info)
+        # Always end the batch on the results tab
+        try:
+            driver.switch_to.window(main_handle)
+        except Exception:
+            logger.error("results tab vanished while scraping batch — aborting page")
+            session_lost = True
+            break
+        if session_lost:
+            break
+    return results, session_lost
+
+
 def run_country(driver: WebDriver, country: str, ws, current_index: int,
                 save_every: int = 1, save_callback=None,
                 max_pages: int | None = None,
-                max_companies: int | None = None) -> int:
+                max_companies: int | None = None,
+                use_tabs: bool = True,
+                tab_batch: int = 20) -> int:
     """Run scrape for a single country, append to ws, return new running index."""
     logger.info("=== country: %s ===", country)
+    if not use_tabs:
+        return _run_country_serial(
+            driver, country, ws, current_index,
+            save_every=save_every, save_callback=save_callback,
+            max_pages=max_pages, max_companies=max_companies,
+        )
 
-    # Phase 1 — collect every detail URL up-front so we don't have to bounce
-    # back to the results page between companies.
+    if not _open_country_results(driver, country, LOGIN_EMAIL, LOGIN_PASSWORD):
+        return current_index
+
+    main_handle = driver.current_window_handle
+    seen_urls: set[str] = set()  # detail urls already written to Excel
+    companies_done = 0
+    started = time.time()
+    page = 1
+    retries_this_page = 0
+    MAX_RETRIES_PER_PAGE = 2
+    while True:
+        # Always verify session before reading the result list
+        if ensure_logged_in(driver, LOGIN_EMAIL, LOGIN_PASSWORD):
+            logger.info("re-login happened — re-opening results")
+            if not _open_country_results(driver, country, LOGIN_EMAIL, LOGIN_PASSWORD):
+                break
+            main_handle = driver.current_window_handle
+            for _ in range(page - 1):
+                if not click_next_page(driver):
+                    break
+
+        page_urls = collect_company_urls(driver)
+        if not page_urls:
+            logger.info("country %s page %s: no urls — stop", country, page)
+            break
+        # Filter out urls we've already scraped (in case of a retry)
+        page_urls = [u for u in page_urls if u not in seen_urls]
+        if not page_urls:
+            logger.info("country %s page %s: all urls already done", country, page)
+        else:
+            if max_companies:
+                remaining = max_companies - companies_done
+                if remaining <= 0:
+                    break
+                page_urls = page_urls[:remaining]
+            logger.info("country %s page %s: %s urls", country, page, len(page_urls))
+
+            infos, session_lost = _scrape_page_tabs(
+                driver, country, page_urls, main_handle, tab_batch=tab_batch,
+            )
+
+            if main_handle not in driver.window_handles:
+                logger.error("main results tab closed — aborting country")
+                break
+
+            if session_lost:
+                _close_extra_tabs(driver, main_handle)
+                if retries_this_page >= MAX_RETRIES_PER_PAGE:
+                    logger.error("page %s exhausted retries — moving on", page)
+                else:
+                    retries_this_page += 1
+                    logger.warning(
+                        "session lost on page %s — re-login + retry (%s/%s)",
+                        page, retries_this_page, MAX_RETRIES_PER_PAGE,
+                    )
+                    ensure_logged_in(driver, LOGIN_EMAIL, LOGIN_PASSWORD,
+                                     navigate_first=True)
+                    if not _open_country_results(driver, country,
+                                                  LOGIN_EMAIL, LOGIN_PASSWORD):
+                        break
+                    main_handle = driver.current_window_handle
+                    for _ in range(page - 1):
+                        if not click_next_page(driver):
+                            break
+                    continue  # retry same page
+
+            # Successful batch: write results + remember scraped urls
+            retries_this_page = 0
+            for info in infos:
+                current_index = append_company_rows(ws, current_index, info)
+                seen_urls.add(info.url)
+                companies_done += 1
+                if save_callback and companies_done % save_every == 0:
+                    save_callback()
+
+        if max_companies and companies_done >= max_companies:
+            logger.info("max_companies hit (%s) — stop", max_companies)
+            break
+        if max_pages and page >= max_pages:
+            logger.info("max_pages hit (%s) — stop", max_pages)
+            break
+        _close_extra_tabs(driver, main_handle)
+        if not click_next_page(driver):
+            break
+        page += 1
+
+    elapsed = time.time() - started
+    if companies_done:
+        logger.info(
+            "country %s: %s scraped in %.1fs (%.1fs/company)",
+            country, companies_done, elapsed, elapsed / companies_done,
+        )
+    return current_index
+
+
+def _run_country_serial(driver: WebDriver, country: str, ws, current_index: int,
+                        save_every: int = 1, save_callback=None,
+                        max_pages: int | None = None,
+                        max_companies: int | None = None) -> int:
+    """Legacy single-tab flow: collect all URLs then visit one-by-one.
+    Kept as a fallback via --no-tabs in case the tabbed flow hits issues.
+    """
     urls = collect_all_urls_for_country(
         driver, country, max_pages=max_pages, max_urls=max_companies,
     )
@@ -919,7 +1177,6 @@ def run_country(driver: WebDriver, country: str, ws, current_index: int,
         urls = urls[:max_companies]
         logger.info("max_companies cap: %s", len(urls))
 
-    # Phase 2 — visit each detail page directly.
     companies_done = 0
     started = time.time()
     for i, url in enumerate(urls, 1):
@@ -954,6 +1211,10 @@ def main() -> int:
     parser.add_argument("--max-companies", type=int, default=None, help="Max companies per country (testing)")
     parser.add_argument("--no-headless", action="store_true", help="Run with visible browser (local only)")
     parser.add_argument("--excel", type=Path, default=EXCEL_PATH, help="Output Excel path")
+    parser.add_argument("--no-tabs", action="store_true",
+                        help="Disable tab-batching mode (visit detail pages one-by-one)")
+    parser.add_argument("--tab-batch", type=int, default=20,
+                        help="How many detail pages to open as tabs at once (default 20)")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -994,6 +1255,8 @@ def main() -> int:
                     save_callback=save,
                     max_pages=args.max_pages,
                     max_companies=args.max_companies,
+                    use_tabs=not args.no_tabs,
+                    tab_batch=args.tab_batch,
                 )
                 current_index = new_index - 1
             except Exception as exc:
