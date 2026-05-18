@@ -141,7 +141,7 @@ def setup_logging(verbose: bool = False) -> None:
 # ──────────────────────────────────────────────────────────────────────────
 
 
-def make_driver(headless: bool = True) -> WebDriver:
+def make_driver(headless: bool = True, block_images: bool = True) -> WebDriver:
     """Create a Chrome WebDriver. Headless by default (only supported mode on CI)."""
     opts = Options()
     if headless:
@@ -151,14 +151,28 @@ def make_driver(headless: bool = True) -> WebDriver:
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--window-size=1920,1080")
     opts.add_argument("--lang=en-US")
+    opts.add_argument("--disable-extensions")
+    opts.add_argument("--disable-background-networking")
+    opts.add_argument("--disable-notifications")
+    opts.add_argument("--blink-settings=imagesEnabled=false" if block_images else "")
     opts.add_argument(f"--user-agent={DEFAULT_USER_AGENT}")
+    # Block images, plugins, etc. via prefs (works even when above flag is filtered)
+    prefs: dict = {
+        "profile.default_content_setting_values.notifications": 2,
+        "credentials_enable_service": False,
+        "profile.password_manager_enabled": False,
+    }
+    if block_images:
+        prefs["profile.managed_default_content_settings.images"] = 2
+        prefs["profile.default_content_setting_values.plugins"] = 2
+    opts.add_experimental_option("prefs", prefs)
     chrome_bin = os.environ.get("CHROME_BIN")
     if chrome_bin and Path(chrome_bin).exists():
         opts.binary_location = chrome_bin
     elif Path("/home/ubuntu/.local/bin/google-chrome").exists():
         opts.binary_location = "/home/ubuntu/.local/bin/google-chrome"
     driver = webdriver.Chrome(options=opts)
-    driver.set_page_load_timeout(180)
+    driver.set_page_load_timeout(120)
     return driver
 
 
@@ -388,10 +402,24 @@ def select_country(driver: WebDriver, country_name: str) -> bool:
     return True
 
 
+def _wait_for_result_list(driver: WebDriver, timeout: int = 20) -> bool:
+    """Wait until at least one company card (or 'no results') is rendered."""
+    try:
+        WebDriverWait(driver, timeout).until(
+            lambda d: bool(d.find_elements(
+                By.CSS_SELECTOR,
+                "ul.membership-list-content-center-list > li a[href*='/en/company/']",
+            )) or bool(d.find_elements(By.XPATH, "//*[contains(.,'No Data') or contains(.,'no data')]"))
+        )
+        return True
+    except TimeoutException:
+        return False
+
+
 def click_search(driver: WebDriver) -> None:
     btn = driver.find_element(By.CSS_SELECTOR, ".company-search-right-search")
     driver.execute_script("arguments[0].click();", btn)
-    time.sleep(8)
+    _wait_for_result_list(driver, timeout=25)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -427,9 +455,31 @@ def click_next_page(driver: WebDriver) -> bool:
             if disabled or "is-disabled" in cls:
                 logger.info("next page button disabled — last page reached")
                 return False
+            # Snapshot the first card href so we can wait until the list refreshes
+            first_href_before = ""
+            try:
+                first_link = driver.find_element(
+                    By.CSS_SELECTOR,
+                    "ul.membership-list-content-center-list > li a[href*='/en/company/']",
+                )
+                first_href_before = first_link.get_attribute("href") or ""
+            except NoSuchElementException:
+                pass
             driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
             driver.execute_script("arguments[0].click();", btn)
-            time.sleep(8)
+            try:
+                WebDriverWait(driver, 25).until(
+                    lambda d: (
+                        (lambda links: bool(links) and (links[0].get_attribute("href") or "") != first_href_before)(
+                            d.find_elements(
+                                By.CSS_SELECTOR,
+                                "ul.membership-list-content-center-list > li a[href*='/en/company/']",
+                            )
+                        )
+                    )
+                )
+            except TimeoutException:
+                logger.warning("timeout waiting for next page to refresh")
             return True
         except Exception as exc:
             logger.warning("error clicking next page: %s", exc)
@@ -674,18 +724,42 @@ def extract_contacts(driver: WebDriver) -> list[ContactInfo]:
 
 def parse_company(driver: WebDriver, country: str, url: str) -> CompanyInfo | None:
     """Visit detail page, parse and return CompanyInfo, or None if suspended."""
-    safe_get(driver, url, settle=6)
-    # Scroll to lazy-load Contact Us section
-    for y in (400, 1000, 1800, 2600, 3600, 5000):
-        driver.execute_script(f"window.scrollTo(0, {y});")
-        time.sleep(0.5)
-    driver.execute_script("window.scrollTo(0, 0);")
-    time.sleep(0.6)
-    close_blocking_overlays(driver)
+    safe_get(driver, url, settle=1)
+    # Wait for the company-name <p> to appear so we don't sleep blindly
+    try:
+        WebDriverWait(driver, 20).until(
+            lambda d: bool(
+                d.find_elements(By.XPATH, "//main//p[contains(@class,'font-bold')]")
+            )
+            or bool(
+                d.find_elements(
+                    By.XPATH,
+                    "//*[contains(.,'It is NOT a JCtrans member') or contains(.,'MEMBERSHIP SUSPEND')]",
+                )
+            )
+        )
+    except TimeoutException:
+        logger.warning("detail page slow / never finished: %s", url)
 
     if is_suspended(driver):
         logger.info("skip suspended/non-member: %s", url)
         return None
+
+    # Scroll to lazy-load Contact Us section (fast — images are blocked)
+    for y in (800, 2000, 4000, 6000):
+        driver.execute_script(f"window.scrollTo(0, {y});")
+        time.sleep(0.2)
+    driver.execute_script("window.scrollTo(0, 0);")
+    time.sleep(0.2)
+    close_blocking_overlays(driver)
+
+    # Wait briefly for the contactCard to render (it lazy-loads after scroll)
+    try:
+        WebDriverWait(driver, 6).until(
+            lambda d: bool(d.find_elements(By.CSS_SELECTOR, "div.contactCard"))
+        )
+    except TimeoutException:
+        pass
 
     info = CompanyInfo(country=country, url=url)
     info.company_name = extract_company_name(driver)
@@ -790,66 +864,85 @@ def save_checkpoint(state: dict) -> None:
 # ──────────────────────────────────────────────────────────────────────────
 
 
+def collect_all_urls_for_country(driver: WebDriver, country: str,
+                                 max_pages: int | None = None,
+                                 max_urls: int | None = None) -> list[str]:
+    """Open the directory, select country, paginate through and collect all URLs.
+
+    Returns a de-duplicated list of /en/company/... URLs in their original order.
+    """
+    safe_get(driver, DIRECTORY_URL, settle=2)
+    close_blocking_overlays(driver)
+    if not select_country(driver, country):
+        logger.warning("could not select country %r — skipping", country)
+        return []
+    click_search(driver)
+
+    all_urls: list[str] = []
+    seen: set[str] = set()
+    page = 1
+    while True:
+        page_urls = collect_company_urls(driver)
+        new = [u for u in page_urls if u not in seen]
+        for u in new:
+            seen.add(u)
+        all_urls.extend(new)
+        logger.info("  page %s: %s urls (cumulative %s)", page, len(new), len(all_urls))
+        if max_urls and len(all_urls) >= max_urls:
+            logger.info("max_urls hit (%s) — stop collecting", max_urls)
+            break
+        if max_pages and page >= max_pages:
+            logger.info("max_pages hit (%s) — stop collecting", max_pages)
+            break
+        if not click_next_page(driver):
+            break
+        page += 1
+    return all_urls
+
+
 def run_country(driver: WebDriver, country: str, ws, current_index: int,
                 save_every: int = 1, save_callback=None,
                 max_pages: int | None = None,
                 max_companies: int | None = None) -> int:
     """Run scrape for a single country, append to ws, return new running index."""
     logger.info("=== country: %s ===", country)
-    safe_get(driver, DIRECTORY_URL, settle=4)
-    close_blocking_overlays(driver)
-    if not select_country(driver, country):
-        logger.warning("could not select country %r — skipping", country)
+
+    # Phase 1 — collect every detail URL up-front so we don't have to bounce
+    # back to the results page between companies.
+    urls = collect_all_urls_for_country(
+        driver, country, max_pages=max_pages, max_urls=max_companies,
+    )
+    logger.info("country %s: %s company urls to visit", country, len(urls))
+    if not urls:
         return current_index
+    if max_companies:
+        urls = urls[:max_companies]
+        logger.info("max_companies cap: %s", len(urls))
 
-    click_search(driver)
-
-    page = 1
+    # Phase 2 — visit each detail page directly.
     companies_done = 0
-    while True:
-        logger.info("country %s page %s — collecting URLs", country, page)
-        urls = collect_company_urls(driver)
-        logger.info("  found %s URLs on page %s", len(urls), page)
-        if not urls:
-            break
+    started = time.time()
+    for i, url in enumerate(urls, 1):
+        logger.info("  [%s/%s] %s", i, len(urls), url)
+        try:
+            info = parse_company(driver, country, url)
+        except Exception as exc:
+            logger.error("error parsing %s: %s", url, exc)
+            logger.debug(traceback.format_exc())
+            continue
+        if info is None:
+            continue
+        current_index = append_company_rows(ws, current_index, info)
+        companies_done += 1
+        if save_callback and companies_done % save_every == 0:
+            save_callback()
 
-        for url in urls:
-            if max_companies and companies_done >= max_companies:
-                logger.info("max companies hit (%s) — breaking", max_companies)
-                return current_index
-            logger.info("  -> %s", url)
-            try:
-                info = parse_company(driver, country, url)
-            except Exception as exc:
-                logger.error("error parsing %s: %s", url, exc)
-                logger.debug(traceback.format_exc())
-                continue
-            if info is None:
-                continue
-            current_index = append_company_rows(ws, current_index, info)
-            companies_done += 1
-            if save_callback and companies_done % save_every == 0:
-                save_callback()
-
-        # Re-open the search results — `parse_company` navigated away
-        logger.info("returning to result list (page %s)", page)
-        safe_get(driver, DIRECTORY_URL, settle=4)
-        if not select_country(driver, country):
-            logger.warning("country reselect failed; aborting country")
-            break
-        click_search(driver)
-        # Advance to the page we were on
-        for _ in range(page - 1):
-            if not click_next_page(driver):
-                break
-        # Now advance to next page
-        if max_pages and page >= max_pages:
-            logger.info("max_pages hit (%s) — stopping", max_pages)
-            break
-        if not click_next_page(driver):
-            break
-        page += 1
-
+    elapsed = time.time() - started
+    if companies_done:
+        logger.info(
+            "country %s: %s/%s scraped in %.1fs (%.1fs/company)",
+            country, companies_done, len(urls), elapsed, elapsed / companies_done,
+        )
     return current_index
 
 
