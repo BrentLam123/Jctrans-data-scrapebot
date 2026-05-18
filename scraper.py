@@ -437,15 +437,22 @@ def list_all_countries(driver: WebDriver) -> list[str]:
     return names
 
 
+def _norm_country(s: str) -> str:
+    """Lowercase + collapse whitespace + strip — for fuzzy country matching."""
+    return " ".join((s or "").split()).strip().lower()
+
+
 def select_country(driver: WebDriver, country_name: str) -> bool:
     items = open_country_dropdown(driver)
+    want = _norm_country(country_name)
     target = None
+    # Pass 1: exact match against currently visible options
     for it in items:
-        if safe_text(it).lower() == country_name.lower():
+        if _norm_country(safe_text(it)) == want:
             target = it
             break
+    # Pass 2: type into the filter input (el-select filterable), exact match
     if target is None:
-        # Try clearing and typing to filter, in case the country isn't initially visible
         try:
             inp = get_country_input(driver)
             inp.clear()
@@ -455,9 +462,41 @@ def select_country(driver: WebDriver, country_name: str) -> bool:
                 By.CSS_SELECTOR, "div.el-select-dropdown.company-search-country li.el-select-dropdown__item"
             )
             for it in items:
-                if safe_text(it).lower() == country_name.lower():
+                if _norm_country(safe_text(it)) == want:
                     target = it
                     break
+        except Exception:
+            pass
+    # Pass 3: substring fallback (e.g. "Kosovo" → "Kosovo, Republic of")
+    # Only do this once the filter input has narrowed the list — picking the
+    # only remaining visible option is safe, but never reach for it among the
+    # full unfiltered dropdown.
+    if target is None:
+        try:
+            visible = [
+                it for it in driver.find_elements(
+                    By.CSS_SELECTOR,
+                    "div.el-select-dropdown.company-search-country li.el-select-dropdown__item",
+                )
+                if it.is_displayed() and safe_text(it)
+            ]
+            # Prefer options whose normalized text starts with the requested name
+            for it in visible:
+                if _norm_country(safe_text(it)).startswith(want):
+                    target = it
+                    logger.info(
+                        "country %r matched as %r (prefix fallback)",
+                        country_name, safe_text(it),
+                    )
+                    break
+            if target is None:
+                # If only ONE option remains after filtering, take it.
+                if len(visible) == 1:
+                    target = visible[0]
+                    logger.info(
+                        "country %r matched as %r (single-result fallback)",
+                        country_name, safe_text(target),
+                    )
         except Exception:
             pass
     if target is None:
@@ -1006,28 +1045,69 @@ def _close_extra_tabs(driver: WebDriver, keep_handle: str) -> None:
 
 
 def _open_urls_in_tabs(driver: WebDriver, urls: list[str], stagger: float = 0.05) -> list[str]:
-    """Open each URL in a new background tab, return the list of new handles in order."""
+    """Open each URL in a new background tab, return the list of new handles in order.
+
+    Uses W3C ``driver.switch_to.new_window('tab')`` instead of ``window.open()``
+    because:
+
+    * It is a WebDriver-level command (CDP), so it bypasses the browser's
+      popup blocker — which is critical when *attached* to a real Edge or
+      Chrome window where ``window.open()`` from a non-user-gesture context
+      is silently blocked.
+    * It is reliable when 20 tabs are opened in rapid succession.
+
+    The tab is navigated using ``location.replace(...)`` (non-blocking) so
+    detail pages load *in parallel* while the caller continues parsing
+    earlier tabs.
+    """
+    main_handle = driver.current_window_handle
+    new_handles: list[str] = []
     before = set(driver.window_handles)
     for url in urls:
-        driver.execute_script("window.open(arguments[0], '_blank');", url)
+        try:
+            driver.switch_to.new_window("tab")
+        except Exception as exc:
+            # Fallback to JS open if CDP for some reason isn't available
+            logger.warning("switch_to.new_window failed: %s — falling back to window.open", exc)
+            try:
+                driver.switch_to.window(main_handle)
+            except Exception:
+                pass
+            try:
+                driver.execute_script("window.open(arguments[0], '_blank');", url)
+            except Exception:
+                continue
+            # Find the newly-opened handle
+            for h in driver.window_handles:
+                if h not in before and h not in new_handles:
+                    new_handles.append(h)
+                    break
+            if stagger:
+                time.sleep(stagger)
+            continue
+
+        h = driver.current_window_handle
+        new_handles.append(h)
+        # Navigate without blocking selenium — let the page load in the
+        # background while we keep opening more tabs.
+        try:
+            driver.execute_script(
+                "window.location.replace(arguments[0]);", url
+            )
+        except Exception:
+            try:
+                driver.get(url)
+            except Exception:
+                pass
         if stagger:
             time.sleep(stagger)
-    # Wait until all tabs are present
+    # Always end on the main results tab
     try:
-        WebDriverWait(driver, 15).until(
-            lambda d: len(set(d.window_handles) - before) >= len(urls)
-        )
-    except TimeoutException:
-        logger.warning(
-            "opened only %s/%s tabs", len(set(driver.window_handles) - before), len(urls)
-        )
-    # Preserve the order in which they were opened
-    new_handles: list[str] = []
-    seen = set(before)
-    for h in driver.window_handles:
-        if h not in seen:
-            new_handles.append(h)
-            seen.add(h)
+        driver.switch_to.window(main_handle)
+    except Exception:
+        pass
+    if len(new_handles) < len(urls):
+        logger.warning("opened only %s/%s tabs", len(new_handles), len(urls))
     return new_handles
 
 
