@@ -45,6 +45,7 @@ import re
 import sys
 import time
 import traceback
+import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -705,8 +706,27 @@ def parse_company(driver: WebDriver, country: str, url: str) -> CompanyInfo | No
 
 
 def open_or_create_workbook(path: Path) -> tuple[Workbook, openpyxl.worksheet.worksheet.Worksheet, int]:
-    if path.exists():
-        wb = load_workbook(path)
+    """Open ``path`` if it's a valid xlsx; otherwise back it up and create a new one."""
+    wb: Workbook | None = None
+    if path.exists() and path.stat().st_size > 0:
+        try:
+            wb = load_workbook(path)
+        except (zipfile.BadZipFile, KeyError, OSError) as exc:
+            backup = path.with_suffix(path.suffix + f".broken-{int(time.time())}.bak")
+            try:
+                path.rename(backup)
+                logger.warning("existing %s is not a valid xlsx (%s) — backed up to %s", path, exc, backup)
+            except OSError:
+                logger.warning("existing %s is not a valid xlsx (%s) — overwriting", path, exc)
+            wb = None
+
+    if wb is None:
+        wb = Workbook()
+        ws = wb.active
+        ws.title = SHEET_NAME
+        ws.append(HEADERS)
+        next_row = 2
+    else:
         if SHEET_NAME in wb.sheetnames:
             ws = wb[SHEET_NAME]
         else:
@@ -716,12 +736,6 @@ def open_or_create_workbook(path: Path) -> tuple[Workbook, openpyxl.worksheet.wo
         if ws.max_row == 1 and (ws.cell(1, 1).value is None):
             ws.append(HEADERS)
             next_row = 2
-    else:
-        wb = Workbook()
-        ws = wb.active
-        ws.title = SHEET_NAME
-        ws.append(HEADERS)
-        next_row = 2
 
     # Auto-size columns roughly
     widths = [6, 16, 30, 14, 10, 30, 30, 50, 50, 50, 20, 20, 30, 18, 18, 18, 22]
