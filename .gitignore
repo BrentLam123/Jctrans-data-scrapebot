@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+
+# Local outputs
+jctrans_data*.xlsx
+jctrans_checkpoint.json
+logs/
+jct_debug/
