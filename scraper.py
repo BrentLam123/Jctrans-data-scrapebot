@@ -1735,10 +1735,18 @@ def _open_country_results(driver: WebDriver, country: str,
 
 def _scrape_page_tabs(driver: WebDriver, items: list[dict],
                       main_handle: str,
-                      tab_batch: int = 20) -> tuple[list[CompanyInfo], bool, bool]:
+                      tab_batch: int = 20) -> tuple[list[CompanyInfo], bool, int, int]:
+    """
+    Scrape detail pages in tab-batched mode.
+
+    Returns: (results, session_lost, n_suspended, n_attempted)
+      - n_attempted: total companies the bot actually tried to parse on this page
+      - n_suspended: how many came back as SUSPENDED_COMPANY (server soft-block view)
+    """
     results: list[CompanyInfo] = []
     session_lost = False
-    found_suspended = False
+    n_suspended = 0
+    n_attempted = 0
     for start in range(0, len(items), tab_batch):
         batch = items[start:start + tab_batch]
         urls = [x['url'] for x in batch]
@@ -1795,11 +1803,12 @@ def _scrape_page_tabs(driver: WebDriver, items: list[dict],
                 try: driver.close()
                 except: pass
             
+            n_attempted += 1
             if info is SESSION_LOST:
                 session_lost = True
                 continue
             if info is SUSPENDED_COMPANY:
-                # Không break, chỉ log và bỏ qua
+                n_suspended += 1
                 logger.warning("Đã xác nhận suspended, bỏ qua...")
                 continue 
             elif info is not None:
@@ -1811,12 +1820,31 @@ def _scrape_page_tabs(driver: WebDriver, items: list[dict],
             session_lost = True
             break
             
-        if session_lost or found_suspended:
+        if session_lost:
             break
             
-    return results, session_lost, found_suspended
+    return results, session_lost, n_suspended, n_attempted
 
-def run_global_list(driver: WebDriver, ws, current_index: int, save_callback, tab_batch: int = 20, start_page: int = 1) -> int:
+def run_global_list(driver: WebDriver, ws, current_index: int, save_callback,
+                    tab_batch: int = 20, start_page: int = 1,
+                    soft_block_threshold: float = 0.5,
+                    soft_block_pause: float = 90.0,
+                    soft_block_retries: int = 2,
+                    page_delay: float = 0.0) -> int:
+    """
+    Walk the global directory page-by-page, tab-scrape each page, write to Excel.
+
+    Rate-limit handling:
+      - After scraping a page, compute ratio = n_suspended / n_attempted.
+        If >= soft_block_threshold (default 0.5) AND attempted >= 3,
+        treat as a server-side soft-block burst-detection (not real suspended).
+      - Save the rows that DID extract successfully, then pause `soft_block_pause`s,
+        halve the per-batch tab count, and re-scrape the remaining URLs on the
+        SAME page (won't paginate forward until soft-block clears or retries run
+        out). Up to `soft_block_retries` retries per page.
+      - Optional `page_delay`: sleep between successful pages to avoid hitting
+        the burst threshold in the first place.
+    """
     start_url = f"https://www.jctrans.com/en/company-page-{start_page}/" if start_page > 1 else DIRECTORY_URL
     
     logger.info("Đang truy cập trang danh sách tổng (Bắt đầu từ Page %s)...", start_page)
@@ -1841,8 +1869,8 @@ def run_global_list(driver: WebDriver, ws, current_index: int, save_callback, ta
     
     while True:
         # --- CƠ CHẾ CHỜ THÔNG MINH ÉP XUNG ---
-        new_items = []
-        page_items = []
+        new_items: list[dict] = []
+        page_items: list[dict] = []
         
         # Quét liên tục mỗi 0.2s để chớp thời cơ ngay khi có data, bỏ qua việc chờ web load xong UI
         for _ in range(50): 
@@ -1865,27 +1893,88 @@ def run_global_list(driver: WebDriver, ws, current_index: int, save_callback, ta
             old_urls = [x['url'].split('/')[-2] for x in page_items]
             logger.info("Page %s: Toàn URL cũ đã scrape. Danh sách đang thấy: %s", page, old_urls[:5])
         else:
-            infos, session_lost, found_suspended = _scrape_page_tabs(
-                driver, new_items, main_handle, tab_batch=tab_batch,
-            )
+            # --- Soft-block aware retry loop for this page ---
+            retry_attempt = 0
+            effective_batch = tab_batch
+            session_lost = False
+            give_up_on_page = False
+            
+            while True:
+                infos, session_lost, n_suspended, n_attempted = _scrape_page_tabs(
+                    driver, new_items, main_handle, tab_batch=effective_batch,
+                )
+                
+                if session_lost:
+                    break
+                
+                # Always persist any companies we DID successfully extract
+                for info in infos:
+                    current_index = append_company_rows(ws, current_index, info)
+                    seen_urls.add(info.url)
+                
+                ratio = (n_suspended / n_attempted) if n_attempted else 0.0
+                logger.info("Page %s: %d ok / %d suspended / %d attempted (ratio=%.0f%%)",
+                            page, len(infos), n_suspended, n_attempted, ratio * 100)
+                
+                # Heuristic: if a majority of companies on a single page come back
+                # as "not a member" / "suspended", it's almost certainly a server-side
+                # soft-block triggered by burst pattern, NOT 10+ real non-members in
+                # a row. Pause, halve batch size, re-scrape only the URLs we didn't
+                # capture yet on this page.
+                if n_attempted >= 3 and ratio >= soft_block_threshold:
+                    if retry_attempt < soft_block_retries:
+                        retry_attempt += 1
+                        effective_batch = max(1, effective_batch // 2)
+                        logger.warning(
+                            "*** SOFT-BLOCK detected on page %s "
+                            "(%d/%d suspended >= %.0f%%). Saving progress, "
+                            "pausing %.0fs, retry %d/%d with --tab-batch=%d ***",
+                            page, n_suspended, n_attempted,
+                            soft_block_threshold * 100, soft_block_pause,
+                            retry_attempt, soft_block_retries, effective_batch,
+                        )
+                        save_callback()
+                        
+                        # Sleep to let jctrans drop the burst counter.
+                        time.sleep(soft_block_pause)
+                        
+                        # Re-derive un-scraped URLs on THIS page (we never
+                        # navigated, so the card list is still here).
+                        page_items_now = collect_company_data(driver)
+                        new_items = [x for x in page_items_now if x['url'] not in seen_urls]
+                        if not new_items:
+                            logger.info("Page %s: nothing left to retry, moving on.", page)
+                            break
+                        logger.info("Page %s: retrying %d URL(s) with smaller batch.",
+                                    page, len(new_items))
+                        continue
+                    else:
+                        give_up_on_page = True
+                        logger.error(
+                            "*** SOFT-BLOCK persists on page %s after %d retries "
+                            "(%d/%d suspended). Skipping the remaining %d company "
+                            "URL(s) on this page and moving forward. ***",
+                            page, soft_block_retries, n_suspended, n_attempted,
+                            len(new_items) - len(infos),
+                        )
+                        break
+                
+                # No soft-block this round → done with this page.
+                break
             
             if session_lost:
                 logger.error("Session lost — aborting")
                 break
-                
-            for info in infos:
-                current_index = append_company_rows(ws, current_index, info)
-                seen_urls.add(info.url)
-                
+            
             if page % 5 == 0:
                 logger.info("Đang lưu Data vào Excel (Page %s)...", page)
                 save_callback()
-            
-            if found_suspended:
-                logger.info(">>> Phát hiện công ty SUSPEND/NON-MEMBER. Kết thúc quá trình Scrape toàn bộ.")
-                break
                 
         _close_extra_tabs(driver, main_handle)
+        
+        if page_delay > 0:
+            logger.info("Đợi %.1fs trước khi sang trang tiếp (--page-delay)...", page_delay)
+            time.sleep(page_delay)
         
         # Đo thời gian click next
         t_before_click = time.time()
@@ -1923,6 +2012,28 @@ def main() -> int:
     parser.add_argument("--verbose", action="store_true")
     # KHAI BÁO THÊM LỆNH START-PAGE
     parser.add_argument("--start-page", type=int, default=1, help="Trang bắt đầu scrape (ví dụ: 70)")
+    # Soft-block / rate-limit handling
+    parser.add_argument(
+        "--soft-block-threshold", type=float, default=0.5,
+        help=(
+            "Nếu trên 1 page tỉ lệ company bị suspended >= ngưỡng này (mặc định 0.5 = 50%%), "
+            "bot coi đây là server soft-block (jctrans hide data do burst quá nhanh), "
+            "không phải suspended thật, sẽ pause + halve tab-batch + retry. "
+            "Đặt 1.0 để tắt logic này."
+        ),
+    )
+    parser.add_argument(
+        "--soft-block-pause", type=float, default=90.0,
+        help="Khi phát hiện soft-block thì pause bao nhiêu giây cho jctrans hạ counter (mặc định 90).",
+    )
+    parser.add_argument(
+        "--soft-block-retries", type=int, default=2,
+        help="Số lần retry tối đa mỗi page khi soft-block (mặc định 2). Mỗi lần retry sẽ tự halve --tab-batch.",
+    )
+    parser.add_argument(
+        "--page-delay", type=float, default=0.0,
+        help="Sleep giữa các page (mặc định 0). Đặt vài giây để tránh trigger soft-block ngay từ đầu.",
+    )
     args = parser.parse_args()
 
     setup_logging(args.verbose)
@@ -1958,6 +2069,10 @@ def main() -> int:
                 save_callback=save,
                 tab_batch=args.tab_batch,
                 start_page=args.start_page, # Truyền tham số vào đây
+                soft_block_threshold=args.soft_block_threshold,
+                soft_block_pause=args.soft_block_pause,
+                soft_block_retries=args.soft_block_retries,
+                page_delay=args.page_delay,
             )
             state["last_updated"] = datetime.now().isoformat(timespec="seconds")
             save()
@@ -1995,10 +2110,6 @@ def main() -> int:
 
     logger.info("done — wrote %s", excel_path)
     return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
 
 
 if __name__ == "__main__":
