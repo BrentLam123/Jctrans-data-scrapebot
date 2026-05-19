@@ -417,14 +417,165 @@ def open_country_dropdown(driver: WebDriver) -> list[WebElement]:
     return items
 
 
+# Aliases / ISO 3166-1 alpha-2 codes that we accept as `--country` input and
+# map to the canonical jctrans dropdown name. Anything outside this list will
+# be matched against the dropdown text directly (case-insensitive).
+COUNTRY_ALIASES: dict[str, str] = {
+    # ISO-2 codes
+    "gb": "United Kingdom",
+    "uk": "United Kingdom",
+    "us": "United States",
+    "usa": "United States",
+    "jp": "Japan",
+    "vn": "Vietnam",
+    "cn": "China",
+    "hk": "Hong Kong, China",
+    "tw": "Taiwan-China",
+    "kr": "South Korea",
+    "kp": "North Korea",
+    "sg": "Singapore",
+    "my": "Malaysia",
+    "id": "Indonesia",
+    "ph": "Philippines",
+    "th": "Thailand",
+    "in": "India",
+    "pk": "Pakistan",
+    "bd": "Bangladesh",
+    "lk": "Sri Lanka",
+    "np": "Nepal",
+    "au": "Australia",
+    "nz": "New Zealand",
+    "de": "Germany",
+    "fr": "France",
+    "it": "Italy",
+    "es": "Spain",
+    "pt": "Portugal",
+    "nl": "Netherlands",
+    "be": "Belgium",
+    "lu": "Luxembourg",
+    "ch": "Switzerland",
+    "at": "Austria",
+    "ie": "Ireland",
+    "se": "Sweden",
+    "no": "Norway",
+    "dk": "Denmark",
+    "fi": "Finland",
+    "is": "Iceland",
+    "pl": "Poland",
+    "cz": "Czechia",
+    "sk": "Slovakia",
+    "hu": "Hungary",
+    "ro": "Romania",
+    "bg": "Bulgaria",
+    "gr": "Greece",
+    "tr": "Turkiye",
+    "ru": "Russia",
+    "ua": "Ukraine",
+    "by": "Belarus",
+    "ee": "Estonia",
+    "lv": "Latvia",
+    "lt": "Lithuania",
+    "rs": "Serbia",
+    "hr": "Croatia",
+    "si": "Slovenia",
+    "ba": "Bosnia and Herzegovina",
+    "mk": "North Macedonia",
+    "al": "Albania",
+    "ca": "Canada",
+    "mx": "Mexico",
+    "br": "Brazil",
+    "ar": "Argentina",
+    "cl": "Chile",
+    "co": "Colombia",
+    "pe": "Peru",
+    "ve": "Venezuela",
+    "uy": "Uruguay",
+    "ec": "Ecuador",
+    "bo": "Bolivia",
+    "py": "Paraguay",
+    "ae": "United Arab Emirates",
+    "sa": "Saudi Arabia",
+    "qa": "Qatar",
+    "kw": "Kuwait",
+    "om": "Oman",
+    "bh": "Bahrain",
+    "jo": "Jordan",
+    "lb": "Lebanon",
+    "il": "Israel",
+    "ir": "Iran",
+    "iq": "Iraq",
+    "eg": "Egypt",
+    "ma": "Morocco",
+    "tn": "Tunisia",
+    "dz": "Algeria",
+    "ly": "Libya",
+    "ng": "Nigeria",
+    "za": "South Africa",
+    "ke": "Kenya",
+    "et": "Ethiopia",
+    "gh": "Ghana",
+    "ci": "Cote D'Ivoire",
+    "sn": "Senegal",
+    "ug": "Uganda",
+    "tz": "Tanzania",
+    # Common spelling variants jctrans uses non-standard forms for
+    "great britain": "United Kingdom",
+    "england": "United Kingdom",
+    "scotland": "United Kingdom",
+    "wales": "United Kingdom",
+    "united states of america": "United States",
+    "america": "United States",
+    "korea": "South Korea",
+    "korea, republic of": "South Korea",
+    "republic of korea": "South Korea",
+    "korea, south": "South Korea",
+    "korea, north": "North Korea",
+    "russian federation": "Russia",
+    "viet nam": "Vietnam",
+    "hong kong": "Hong Kong, China",
+    "taiwan": "Taiwan-China",
+    "turkey": "Turkiye",
+    "ivory coast": "Cote D'Ivoire",
+    "czech republic": "Czechia",
+}
+
+
+# Junk entries that show up in the jctrans dropdown but are NOT real
+# countries (e.g. orphan 2-letter codes that return mixed/wrong data).
+# Anything we see here will be filtered out of list_all_countries().
+_KNOWN_JUNK_COUNTRY_ENTRIES = {"gb", "aq"}
+
+
+def _looks_like_real_country(name: str) -> bool:
+    """Heuristic for filtering jctrans dropdown junk entries.
+
+    Real countries:
+      - have at least 4 characters (catches all real short names like
+        Guam, Niue, Oman, Chad, Peru, Laos, Fiji, Togo)
+      - contain at least one space, OR are not all uppercase
+        (eliminates ISO-style codes like "GB" / "AQ")
+      - are not explicitly blacklisted.
+    """
+    s = (name or "").strip()
+    if len(s) < 4:
+        return False
+    if s.lower() in _KNOWN_JUNK_COUNTRY_ENTRIES:
+        return False
+    # A 2-3 letter all-uppercase token (with no spaces) is almost certainly
+    # a code, not a real country name.
+    if len(s) <= 3 and s.isupper() and " " not in s:
+        return False
+    return True
+
+
 def list_all_countries(driver: WebDriver) -> list[str]:
     items = open_country_dropdown(driver)
-    names = []
+    names: list[str] = []
     for it in items:
         try:
             if it.is_displayed():
                 t = safe_text(it)
-                if t:
+                if t and _looks_like_real_country(t):
                     names.append(t)
         except Exception:
             pass
@@ -434,7 +585,14 @@ def list_all_countries(driver: WebDriver) -> list[str]:
     except Exception:
         pass
     time.sleep(0.5)
-    return names
+    # De-duplicate while preserving order
+    seen: set[str] = set()
+    out: list[str] = []
+    for n in names:
+        if n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
 
 
 def _norm_country(s: str) -> str:
@@ -442,9 +600,35 @@ def _norm_country(s: str) -> str:
     return " ".join((s or "").split()).strip().lower()
 
 
+def resolve_country_alias(country_name: str) -> str:
+    """Translate ISO-2 codes / common variants to the canonical jctrans name."""
+    key = _norm_country(country_name)
+    return COUNTRY_ALIASES.get(key, country_name)
+
+
 def select_country(driver: WebDriver, country_name: str) -> bool:
+    """Select a country in the jctrans dropdown — strict, never silent-wrong.
+
+    Returns True only if we successfully clicked an option whose normalized
+    text equals (or contains) the resolved name. Returns False — and the
+    caller MUST skip the country — if no clean match is found.
+    """
+    # Step 0: resolve aliases / ISO codes up-front, so "GB" → "United Kingdom".
+    resolved = resolve_country_alias(country_name)
+    if resolved != country_name:
+        logger.info("country alias %r → %r", country_name, resolved)
+    want = _norm_country(resolved)
+    if not want:
+        logger.warning("empty country name — refusing to select")
+        return False
+    if not _looks_like_real_country(resolved):
+        logger.warning(
+            "country %r looks like a junk dropdown entry — refusing to select",
+            country_name,
+        )
+        return False
+
     items = open_country_dropdown(driver)
-    want = _norm_country(country_name)
     target = None
     # Pass 1: exact match against currently visible options
     for it in items:
@@ -456,10 +640,11 @@ def select_country(driver: WebDriver, country_name: str) -> bool:
         try:
             inp = get_country_input(driver)
             inp.clear()
-            inp.send_keys(country_name)
+            inp.send_keys(resolved)
             time.sleep(1.5)
             items = driver.find_elements(
-                By.CSS_SELECTOR, "div.el-select-dropdown.company-search-country li.el-select-dropdown__item"
+                By.CSS_SELECTOR,
+                "div.el-select-dropdown.company-search-country li.el-select-dropdown__item",
             )
             for it in items:
                 if _norm_country(safe_text(it)) == want:
@@ -467,10 +652,11 @@ def select_country(driver: WebDriver, country_name: str) -> bool:
                     break
         except Exception:
             pass
-    # Pass 3: substring fallback (e.g. "Kosovo" → "Kosovo, Republic of")
-    # Only do this once the filter input has narrowed the list — picking the
-    # only remaining visible option is safe, but never reach for it among the
-    # full unfiltered dropdown.
+    # Pass 3: STRICT prefix match — only when the filter narrows to a small
+    # set AND the option starts with the requested name (case-insensitive).
+    # Prevents the old "GB → first remaining unrelated option" silent
+    # mismatch by refusing to pick anything that doesn't actually start with
+    # the requested string.
     if target is None:
         try:
             visible = [
@@ -480,27 +666,41 @@ def select_country(driver: WebDriver, country_name: str) -> bool:
                 )
                 if it.is_displayed() and safe_text(it)
             ]
-            # Prefer options whose normalized text starts with the requested name
             for it in visible:
-                if _norm_country(safe_text(it)).startswith(want):
+                norm = _norm_country(safe_text(it))
+                if norm.startswith(want + " ") or norm.startswith(want + ","):
                     target = it
                     logger.info(
                         "country %r matched as %r (prefix fallback)",
                         country_name, safe_text(it),
                     )
                     break
-            if target is None:
-                # If only ONE option remains after filtering, take it.
-                if len(visible) == 1:
-                    target = visible[0]
-                    logger.info(
-                        "country %r matched as %r (single-result fallback)",
-                        country_name, safe_text(target),
-                    )
         except Exception:
             pass
     if target is None:
-        logger.warning("country %r not found in dropdown", country_name)
+        logger.warning(
+            "country %r (resolved=%r) not found in dropdown — skipping",
+            country_name, resolved,
+        )
+        # Close dropdown so we don't leave it open for the next country
+        try:
+            get_country_input(driver).send_keys(Keys.ESCAPE)
+        except Exception:
+            pass
+        return False
+    # Sanity-check: verify the option's text actually matches before clicking.
+    picked = _norm_country(safe_text(target))
+    if picked != want and not (
+        picked.startswith(want + " ") or picked.startswith(want + ",")
+    ):
+        logger.warning(
+            "country %r matched %r — looks wrong, refusing to click",
+            country_name, safe_text(target),
+        )
+        try:
+            get_country_input(driver).send_keys(Keys.ESCAPE)
+        except Exception:
+            pass
         return False
     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", target)
     target.click()
@@ -1025,70 +1225,284 @@ def extract_contacts(driver: WebDriver) -> list[ContactInfo]:
     return contacts
 
 
-def _parse_current_tab(driver: WebDriver, country: str, url: str,
-                       wait_secs: int = 25) -> CompanyInfo | None:
-    """Parse the detail page that is already loaded in the current tab.
+# Sentinel returned by _parse_current_tab when the session got kicked.
+SESSION_LOST = object()
 
-    Does NOT call driver.get(). Returns None if the company is suspended /
-    non-member.
-    """
-    # Wait for the company-name <p> to appear so we don't sleep blindly
+# Single-pass JS extractor — pulls every field we want in ONE CDP round-trip.
+# This is the biggest perf lever on a remote (Windows) machine where each
+# Selenium command costs 50–100 ms over the wire — the old per-field
+# extractors did ~30–50 round-trips per detail tab, ≈3 s per company in
+# pure overhead. With this one call we cut the per-company budget by
+# roughly a factor of 2–3.
+_EXTRACT_JS = r"""
+return (function() {
+    const out = {
+        company_name: '', member_id: '', year: '', location: '',
+        website: '', main_business: '', sea_freight: '', air_freight: '',
+        contacts: [], is_suspended: false, logged_out: false, ready: false,
+    };
+    // Logged-out: visible "SIGN IN" button => server is rendering masked data
+    const loginBtn = Array.from(document.querySelectorAll('button.login-btn'))
+        .find(b => b.offsetParent !== null);
+    if (loginBtn) { out.logged_out = true; return out; }
+
+    const mainEl = document.querySelector('main') || document.body;
+    const mainText = (mainEl.innerText || '').toLowerCase();
+    if (mainText.includes('it is not a jctrans member')
+        || mainText.includes('membership suspend')) {
+        out.is_suspended = true;
+        return out;
+    }
+
+    // Company name: first <p> with both font-bold + break-word in main
+    const nameEls = mainEl.querySelectorAll(
+        'p[class*="font-bold"][class*="break-word"]'
+    );
+    for (const el of nameEls) {
+        const t = (el.innerText || '').trim();
+        if (t) { out.company_name = t; break; }
+    }
+    if (!out.company_name) {
+        const h1 = document.querySelector('h1');
+        if (h1) out.company_name = (h1.innerText || '').trim();
+    }
+    if (!out.company_name) { return out; }
+    out.ready = true;
+
+    // Member ID — find an element whose text contains "Member ID" and
+    // grab the next <b> in document order.
+    (function() {
+        const all = mainEl.querySelectorAll('*');
+        for (const el of all) {
+            if (el.children.length > 8) continue;
+            const t = (el.textContent || '').trim().toLowerCase();
+            if (!t.includes('member id')) continue;
+            const walker = document.createTreeWalker(
+                mainEl, NodeFilter.SHOW_ELEMENT, null
+            );
+            walker.currentNode = el;
+            let n = walker.nextNode();
+            let safety = 60;
+            while (n && safety-- > 0) {
+                if (n.tagName === 'B') {
+                    const bt = (n.innerText || '').trim();
+                    if (bt && !bt.toLowerCase().includes('member id')) {
+                        out.member_id = bt; return;
+                    }
+                }
+                n = walker.nextNode();
+            }
+            return;
+        }
+    })();
+
+    // Year (e.g. "15-Year")
+    {
+        const re = /(\d+\s*-\s*Year)/i;
+        const spans = mainEl.querySelectorAll('span');
+        for (const s of spans) {
+            const m = (s.innerText || '').match(re);
+            if (m) { out.year = m[1]; break; }
+        }
+    }
+
+    // desc-box label/value pair (Location, Website, ...)
+    function descBoxPair(label) {
+        const ps = mainEl.querySelectorAll('p[class*="desc-box"]');
+        for (const p of ps) {
+            if ((p.innerText || '').trim() === label) {
+                const sib = p.nextElementSibling;
+                if (sib && sib.tagName === 'P') {
+                    return (sib.innerText || '').trim();
+                }
+            }
+        }
+        return '';
+    }
+    out.location = descBoxPair('Location') || descBoxPair('Country/Region');
+    out.website = descBoxPair('Website');
+
+    // Chips block: heading element → ancestor with .normal-boxShadow → chips
+    function chipsForHeading(heading) {
+        const all = mainEl.querySelectorAll('*');
+        for (const h of all) {
+            if (h.children.length !== 0) continue;
+            if ((h.innerText || '').trim() !== heading) continue;
+            let box = h;
+            while (box) {
+                const cls = (typeof box.className === 'string')
+                    ? box.className : '';
+                if (cls.includes('normal-boxShadow')) break;
+                box = box.parentElement;
+            }
+            if (!box) continue;
+            const chipEls = box.querySelectorAll(
+                'div[class*="px-4"][class*="py-2"][class*="rounded"]'
+            );
+            const chips = []; const seen = new Set();
+            for (const c of chipEls) {
+                const txt = (c.innerText || '').trim();
+                if (!txt) continue;
+                const first = txt.split('\n')[0].trim();
+                if (first && !seen.has(first)) {
+                    seen.add(first); chips.push(first);
+                }
+            }
+            if (chips.length) return chips.join(' | ');
+        }
+        return '';
+    }
+    out.main_business = chipsForHeading('Main Business');
+    out.sea_freight = chipsForHeading('Sea Freight Advantageous');
+    out.air_freight = chipsForHeading('Air Freight Advantageous');
+
+    // Contacts — one entry per .contactCard
+    const cards = document.querySelectorAll('div.contactCard');
+    for (const card of cards) {
+        const ci = {
+            name: '', position: '', email: '', phone: '',
+            wechat: '', whatsapp: '', skype: '',
+        };
+        const nameEl = card.querySelector('.im-info-box');
+        if (nameEl) {
+            const t = (nameEl.innerText || '').trim();
+            if (t) ci.name = t.split('\n')[0].trim();
+            // Position = first sibling DIV after .im-info-box
+            let sib = nameEl.nextElementSibling;
+            while (sib && sib.tagName !== 'DIV') sib = sib.nextElementSibling;
+            if (sib) ci.position = (sib.innerText || '').trim();
+        }
+        // Chips: slot-based detection. The contact card has a horizontal
+        // chip container whose direct children are slot wrappers, in this
+        // fixed order: [mail, phone, wechat, whatsapp, skype, ...socials].
+        // Empty slots render as <div><!----></div>. mail/phone use an
+        // <g id="icon/X"> SVG we can sniff directly, but whatsapp/skype use
+        // a different iconfont SVG with no identifier — so we map by slot
+        // index as a fallback.
+        const SLOT_ORDER = ['mail', 'phone', 'wechat', 'whatsapp', 'skype'];
+        let chipContainer = null;
+        const firstChip = card.querySelector(
+            'div.flex.items-center.justify-start[style*="inline-flex"]'
+        );
+        if (firstChip && firstChip.parentElement) {
+            chipContainer = firstChip.parentElement.parentElement;
+        }
+        if (!chipContainer) {
+            chipContainer = card.querySelector(
+                'div.flex.flex-wrap, div[class*="flex-wrap"]'
+            );
+        }
+        if (chipContainer) {
+            const slots = Array.from(chipContainer.children);
+            for (let i = 0; i < slots.length; i++) {
+                const slot = slots[i];
+                const chip = slot.querySelector(
+                    'div.flex.items-center.justify-start, div.flex.items-center'
+                );
+                if (!chip) continue;
+                const contentEl = chip.querySelector('div.content');
+                const value = contentEl ? (contentEl.innerText || '').trim() : '';
+                if (!value) continue;
+                // Prefer the icon id if present, fall back to slot position.
+                const html = chip.innerHTML || '';
+                const m = html.match(/<g\s+id="icon\/([\w\-]+)"/i);
+                let iconType = m ? m[1].toLowerCase() : '';
+                if (!iconType && i < SLOT_ORDER.length) {
+                    iconType = SLOT_ORDER[i];
+                }
+                if (iconType === 'mail') ci.email = value;
+                else if (iconType === 'phone') ci.phone = value;
+                else if (iconType === 'wechat') ci.wechat = value;
+                else if (iconType === 'whatsapp') ci.whatsapp = value;
+                else if (iconType === 'skype') ci.skype = value;
+            }
+        }
+        if (ci.name || ci.email || ci.phone) out.contacts.push(ci);
+    }
+    return out;
+})();
+"""
+
+
+def _extract_all_via_js(driver: WebDriver) -> dict | None:
     try:
-        WebDriverWait(driver, wait_secs).until(
-            lambda d: bool(
-                d.find_elements(By.XPATH, "//main//p[contains(@class,'font-bold')]")
-            )
-            or bool(
-                d.find_elements(
-                    By.XPATH,
-                    "//*[contains(.,'It is NOT a JCtrans member') or contains(.,'MEMBERSHIP SUSPEND')]",
-                )
-            )
-        )
-    except TimeoutException:
-        logger.warning("detail page slow / never finished: %s", url)
-
-    if is_suspended(driver):
-        logger.info("skip suspended/non-member: %s", url)
+        return driver.execute_script(_EXTRACT_JS)
+    except Exception as exc:
+        logger.debug("extract JS failed: %s", exc)
         return None
 
-    # Jump straight to the bottom to trigger lazy-load (Vue IntersectionObserver).
-    # One big jump is much faster than multiple small scrolls and works just as
-    # well in practice — the contactCard WebDriverWait below catches the result.
-    driver.execute_script(
-        "window.scrollTo(0, document.body.scrollHeight);"
-    )
-    close_blocking_overlays(driver)
 
+def _parse_current_tab(driver: WebDriver, country: str, url: str,
+                       wait_secs: int = 25):
+    """Parse the detail page that is already loaded in the current tab.
+
+    Returns:
+        CompanyInfo — full data extracted.
+        None        — company is suspended/non-member; skip.
+        SESSION_LOST — the page rendered as logged-out; caller should retry.
+    """
+    # Kick lazy-load (IntersectionObserver) before we start polling.
     try:
-        WebDriverWait(driver, 6).until(
-            lambda d: bool(d.find_elements(By.CSS_SELECTOR, "div.contactCard"))
-        )
-    except TimeoutException:
-        # Fallback: try a couple of incremental scrolls in case the single jump
-        # didn't trigger the observer (some pages render only after a real
-        # scroll step).
-        for y in (1500, 4000, 6000):
-            driver.execute_script(f"window.scrollTo(0, {y});")
-            time.sleep(0.1)
-        try:
-            WebDriverWait(driver, 4).until(
-                lambda d: bool(d.find_elements(By.CSS_SELECTOR, "div.contactCard"))
-            )
-        except TimeoutException:
-            pass
-    driver.execute_script("window.scrollTo(0, 0);")
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+    except Exception:
+        pass
+
+    deadline = time.time() + wait_secs
+    data: dict | None = None
+    poll = 0.15
+    while time.time() < deadline:
+        data = _extract_all_via_js(driver)
+        if data is None:
+            time.sleep(poll)
+            continue
+        if data.get("logged_out"):
+            logger.warning("logged out (detected on %s)", url)
+            return SESSION_LOST
+        if data.get("is_suspended"):
+            logger.info("skip suspended/non-member: %s", url)
+            return None
+        if data.get("ready"):
+            break
+        time.sleep(poll)
+
+    if not data or not data.get("ready"):
+        logger.warning("could not parse %s (slow / never finished)", url)
+        return None
+
+    # company_name is up — but contactCard lazy-loads via IntersectionObserver
+    # and may take a tick after we scrolled. Quick second-pass for contacts.
+    if not data.get("contacts"):
+        for _ in range(10):  # up to ~1.5 s extra
+            time.sleep(0.15)
+            data2 = _extract_all_via_js(driver)
+            if data2 and data2.get("contacts"):
+                data = data2
+                break
+            if data2 and data2.get("ready"):
+                # Page is ready, still no contacts — keep waiting in case
+                # IntersectionObserver hasn't fired yet, but stop after the loop.
+                data = data2
 
     info = CompanyInfo(country=country, url=url)
-    info.company_name = extract_company_name(driver)
-    info.member_id = extract_member_id(driver)
-    info.year = extract_year(driver)
-    info.location = extract_location(driver)
-    info.website = extract_website(driver)
-    info.main_business = extract_chips(driver, "Main Business")
-    info.sea_freight = extract_chips(driver, "Sea Freight Advantageous")
-    info.air_freight = extract_chips(driver, "Air Freight Advantageous")
-    info.contacts = extract_contacts(driver)
+    info.company_name = data.get("company_name") or ""
+    info.member_id = data.get("member_id") or ""
+    info.year = data.get("year") or ""
+    info.location = data.get("location") or ""
+    info.website = data.get("website") or ""
+    info.main_business = data.get("main_business") or ""
+    info.sea_freight = data.get("sea_freight") or ""
+    info.air_freight = data.get("air_freight") or ""
+    info.contacts = []
+    for c in data.get("contacts") or []:
+        info.contacts.append(ContactInfo(
+            name=c.get("name") or "",
+            position=c.get("position") or "",
+            email=c.get("email") or "",
+            phone=c.get("phone") or "",
+            wechat=c.get("wechat") or "",
+            whatsapp=c.get("whatsapp") or "",
+            skype=c.get("skype") or "",
+        ))
     return info
 
 
@@ -1342,15 +1756,6 @@ def _scrape_page_tabs(driver: WebDriver, country: str, urls: list[str],
             except Exception as exc:
                 logger.warning("could not switch to tab for %s: %s", url, exc)
                 continue
-            # Detect session loss BEFORE wasting time parsing masked data
-            if not is_logged_in(driver):
-                logger.warning("logged out (detected on %s) — aborting batch", url)
-                session_lost = True
-                try:
-                    driver.close()
-                except Exception:
-                    pass
-                continue
             try:
                 info = _parse_current_tab(driver, country, url)
             except Exception as exc:
@@ -1362,6 +1767,10 @@ def _scrape_page_tabs(driver: WebDriver, country: str, urls: list[str],
                     driver.close()
                 except Exception:
                     pass
+            if info is SESSION_LOST:
+                logger.warning("session lost on %s — aborting batch", url)
+                session_lost = True
+                continue
             if info is not None:
                 results.append(info)
         # Always end the batch on the results tab
