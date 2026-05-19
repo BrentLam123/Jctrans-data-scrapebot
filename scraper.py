@@ -76,7 +76,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 LOGIN_EMAIL = os.environ.get("JCT_EMAIL", "brent@pio-logistics.vn")
 LOGIN_PASSWORD = os.environ.get("JCT_PASSWORD", "0925587314aA")
 
-DIRECTORY_URL = "https://www.jctrans.com/en/directory/"
+DIRECTORY_URL = "https://www.jctrans.com/en/company/"
 
 EXCEL_PATH = Path(os.environ.get("JCT_EXCEL", "jctrans_data.xlsx"))
 SHEET_NAME = "Data"
@@ -160,6 +160,10 @@ def make_driver(browser: str = "chrome", headless: bool = True,
         opts = EdgeOptions()
     else:
         opts = Options()
+
+    # --- BẢN VÁ SIÊU TỐC: BỎ QUA CHỜ SCRIPT CHAT/QUẢNG CÁO NGOẠI LAI ---
+    opts.page_load_strategy = 'eager'
+    opts.add_argument("--log-level=3")  # Tiện tay tắt luôn mấy dòng báo lỗi rác của trình duyệt trên Terminal
 
     if attach:
         opts.add_experimental_option("debuggerAddress", attach)
@@ -733,74 +737,44 @@ def click_search(driver: WebDriver) -> None:
 # ──────────────────────────────────────────────────────────────────────────
 
 
-def _collect_company_urls_once(driver: WebDriver) -> list[str]:
-    """Return the *currently rendered* company URLs in one CDP round-trip.
-
-    No retry — used both directly (during settle polling) and by the
-    retry wrapper below.
-    """
+def collect_company_data(driver: WebDriver) -> list[dict]:
     try:
-        result = driver.execute_script(
-            "const out = [];"
-            "const seen = new Set();"
-            "const links = document.querySelectorAll("
-            "  'ul.membership-list-content-center-list > li a[href*=\"/en/company/\"]'"
-            ");"
-            "for (const a of links) {"
-            "  const h = a.href;"
-            "  if (h && !seen.has(h)) { seen.add(h); out.push(h); }"
-            "}"
-            "return out;"
-        )
+        js_code = """
+        const out = [];
+        const seen = new Set();
+        // Quét toàn bộ link công ty trong <main>, không phụ thuộc vào ul > li nữa
+        const links = document.querySelectorAll('main a[href*="/en/company/"]');
+        for (const a of links) {
+          const h = a.href;
+          // Loại bỏ các link rác, chỉ lấy link chuẩn đúng định dạng ID
+          if (h && !seen.has(h) && h.match(/\/en\/company\/[a-zA-Z0-9_-]+\/?$/)) {
+            seen.add(h);
+            let country = '';
+            const spans = a.querySelectorAll('span');
+            for (const span of spans) {
+              const txt = (span.innerText || '').trim();
+              if (txt.includes(' - ')) {
+                country = txt.split('-').pop().trim();
+                break;
+              }
+            }
+            if (!country) {
+              const exactSpan = a.querySelector('div:nth-of-type(2) > span:nth-of-type(2)');
+              if (exactSpan) {
+                const txt = (exactSpan.innerText || '').trim();
+                country = txt.includes('-') ? txt.split('-').pop().trim() : txt;
+              }
+            }
+            out.push({url: h, country: country});
+          }
+        }
+        return out;
+        """
+        result = driver.execute_script(js_code)
         return list(result or [])
     except Exception as exc:
-        logger.warning("collect_company_urls JS path failed: %s — falling back", exc)
-    # Fallback: WebElement-based, with stale guards.
-    urls: list[str] = []
-    seen: set[str] = set()
-    try:
-        cards = driver.find_elements(
-            By.CSS_SELECTOR, "ul.membership-list-content-center-list > li"
-        )
-    except Exception:
-        return urls
-    for card in cards:
-        try:
-            link = card.find_element(By.CSS_SELECTOR, "a[href*='/en/company/']")
-            href = link.get_attribute("href")
-            if href and href not in seen:
-                seen.add(href)
-                urls.append(href)
-        except (NoSuchElementException, StaleElementReferenceException):
-            continue
-    return urls
-
-
-def collect_company_urls(driver: WebDriver, max_wait: float = 12.0,
-                          poll: float = 0.5) -> list[str]:
-    """Collect company detail URLs from the current results page.
-
-    Vue can leave the list momentarily empty between pagination clicks
-    (clear → API call → re-render). We poll up to ``max_wait`` seconds for
-    a non-empty, *stable* card list. ``stable`` here means: two consecutive
-    polls with identical hrefs. If we never see a stable non-empty result,
-    we return whatever the last poll produced (possibly empty).
-    """
-    deadline = time.time() + max_wait
-    prev: list[str] = []
-    last_non_empty: list[str] = []
-    while True:
-        urls = _collect_company_urls_once(driver)
-        if urls:
-            last_non_empty = urls
-            # Two identical, non-empty polls in a row → settled.
-            if prev and prev == urls:
-                return urls
-        prev = urls
-        if time.time() >= deadline:
-            return last_non_empty
-        time.sleep(poll)
-
+        logger.warning("collect_company_data JS path failed: %s", exc)
+        return []
 
 def _current_page_num(driver: WebDriver) -> str:
     """Return the active page number text from el-pagination, or '' if not found."""
@@ -835,24 +809,24 @@ def _first_card_href(driver: WebDriver) -> str:
     except Exception:
         return ""
 
-
 def _all_card_hrefs(driver: WebDriver) -> list[str]:
     """Return *all* current card hrefs (used to detect real list change)."""
     try:
         result = driver.execute_script(
             "return Array.from(document.querySelectorAll("
-            "  'ul.membership-list-content-center-list > li a[href*=\"/en/company/\"]'"
-            ")).map(a => a.href);"
+            "  'main a[href*=\"/en/company/\"]'"
+            ")).map(a => a.href).filter(h => h.match(/\\/en\\/company\\/[a-zA-Z0-9_-]+\\/?$/));"
         )
-        return list(result or [])
+        return list(set(result or []))
     except Exception:
         return []
-
-
+    
 def _find_enabled_next_btn(driver: WebDriver) -> WebElement | None:
     """Return a fresh, enabled .btn-next element (or None)."""
     for b in driver.find_elements(By.CSS_SELECTOR, "button.btn-next"):
         try:
+            if not b.is_displayed():
+                continue
             if b.get_attribute("disabled"):
                 continue
             cls = b.get_attribute("class") or ""
@@ -872,6 +846,8 @@ def _next_btn_state(driver: WebDriver) -> str:
     enabled = False
     for b in btns:
         try:
+            if not b.is_displayed():
+                continue
             cls = b.get_attribute("class") or ""
             disabled = b.get_attribute("disabled")
             if not disabled and "is-disabled" not in cls:
@@ -890,16 +866,7 @@ def _page_num_int(driver: WebDriver) -> int | None:
 
 
 def _click_next_page_inner(driver: WebDriver) -> bool:
-    # Make sure pagination is in viewport.
-    try:
-        driver.execute_script(
-            "const b = document.querySelector('button.btn-next');"
-            "if (b) b.scrollIntoView({block:'center'});"
-        )
-    except Exception:
-        pass
-
-    # Wait for at least one .btn-next to be present (Vue may re-render briefly).
+    # Wait for at least one .btn-next to be present
     try:
         WebDriverWait(driver, 10).until(
             lambda d: bool(d.find_elements(By.CSS_SELECTOR, "button.btn-next"))
@@ -915,68 +882,49 @@ def _click_next_page_inner(driver: WebDriver) -> bool:
         logger.info("next page button disabled — last page reached")
         return False
 
+    # FIX: Chờ tab chính thực sự hiển thị card trước khi lấy trạng thái cũ
+    try:
+        WebDriverWait(driver, 5).until(lambda d: bool(_all_card_hrefs(d)))
+    except TimeoutException:
+        pass
+
     num_before = _page_num_int(driver)
     hrefs_before = set(_all_card_hrefs(driver))
-    logger.info(
-        "pagination: clicking next (current page=%s, cards=%s)",
-        num_before, len(hrefs_before),
-    )
-
-    # Closure used by `_advanced` to require the post-click card set to be
-    # *stable* across two consecutive polls. Without this we can latch onto
-    # a transient state (cards present briefly, then cleared by Vue while
-    # the API response is still in flight) and declare advance success
-    # while the list is actually empty, causing the loop to think the
-    # country has no more pages.
-    last_seen_set: list[set[str]] = [set()]
+    logger.info("pagination: clicking next (current page=%s, cards=%s)", num_before, len(hrefs_before))
 
     def _advanced(d: WebDriver) -> bool:
-        """Return True only when:
-          - the page number advanced (if we know it),
-          - the card list contains at least one valid /en/company/ href that
-            isn't part of the previous page,
-          - *and* the same card set has been observed across two
-            consecutive polls (i.e. Vue has finished re-rendering).
-        """
         try:
             new_num = _page_num_int(d)
             new_hrefs = _all_card_hrefs(d)
-            # Cards must be present and all hrefs must be non-empty.
-            if not new_hrefs or any(not h for h in new_hrefs):
-                last_seen_set[0] = set()
+            if not new_hrefs:
                 return False
             new_set = set(new_hrefs)
-            # Page number must have advanced (when both numbers are known).
             if num_before is not None and new_num is not None:
                 if new_num <= num_before:
-                    last_seen_set[0] = set()
                     return False
-            # Card list must actually move forward — at least one fresh
-            # href that wasn't on the previous page.
-            if hrefs_before and new_set == hrefs_before:
-                last_seen_set[0] = set()
-                return False
-            if hrefs_before and new_set.issubset(hrefs_before):
-                last_seen_set[0] = set()
-                return False
-            # Settle check: the same set must show up on TWO consecutive
-            # polls (~500ms apart). Otherwise Vue is still re-rendering.
-            if last_seen_set[0] != new_set:
-                last_seen_set[0] = new_set
+            # FIX: Nếu hrefs_before có dữ liệu thì mới so sánh tập hợp
+            if hrefs_before:
+                if new_set == hrefs_before or new_set.issubset(hrefs_before):
+                    return False
+            elif num_before == new_num:
                 return False
             return True
         except StaleElementReferenceException:
-            last_seen_set[0] = set()
             return False
 
-    # Click — JS click + always re-find the button (avoid holding a stale ref)
     for attempt in (1, 2):
         btn = _find_enabled_next_btn(driver)
         if btn is None:
             logger.info("next-page button vanished before click — assume done")
             return False
         try:
-            driver.execute_script("arguments[0].click();", btn)
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+            time.sleep(0.5)
+            # Ưu tiên native click để kích hoạt event của Vue, fallback bằng JS
+            try:
+                btn.click()
+            except Exception:
+                driver.execute_script("arguments[0].click();", btn)
         except StaleElementReferenceException:
             # Re-find and try once more
             btn = _find_enabled_next_btn(driver)
@@ -986,37 +934,30 @@ def _click_next_page_inner(driver: WebDriver) -> bool:
                 driver.execute_script("arguments[0].click();", btn)
             except Exception as exc:
                 logger.warning("retry click failed: %s", exc)
+                
+        # Giảm thời gian chờ từ 35s xuống 12s. Nếu quá 12s mà web chưa lật trang 
+        # thì coi như "ép" nó phải chạy tiếp chứ không đứng đợi nữa.
+        # Tăng thời gian chờ lên 25s, và nếu timeout thì vẫn cho phép tiếp tục lướt 
+        # (coi như là đã lật trang thành công dù bot không thấy trang mới)
         try:
-            WebDriverWait(driver, 35).until(_advanced)
+            WebDriverWait(driver, 25).until(_advanced)
         except TimeoutException:
-            if attempt == 1:
-                logger.warning(
-                    "next-page click did not produce a change in 35s — retrying"
-                )
-                continue
-            logger.error(
-                "next-page transition still failing after retry — giving up on pagination"
-            )
-            return False
-        # Got an advance — wait for the new card list to render.
+            logger.warning("Next-page load chậm quá, bot vẫn sẽ thử cào tiếp trang sau!")
+            # Thay vì return False (dừng bot), ta ép nó tiếp tục cào
+            logger.warning("Next-page transition vẫn lỗi, nhưng bot sẽ ép sang trang tiếp theo!")
+            return True
+            
         try:
-            WebDriverWait(driver, 15).until(
-                lambda d: bool(d.find_elements(
-                    By.CSS_SELECTOR,
-                    "ul.membership-list-content-center-list > li a[href*='/en/company/']",
-                ))
+            WebDriverWait(driver, 5).until(
+                lambda d: bool(d.find_elements(By.CSS_SELECTOR, "main a[href*='/en/company/']"))
             )
         except TimeoutException:
-            logger.warning("page transition detected but cards never re-rendered")
+            pass
+            
         num_after = _page_num_int(driver)
-        href_after = _first_card_href(driver)
-        logger.info(
-            "pagination: advanced to page=%s, first href=%s",
-            num_after, href_after.rsplit("/", 1)[-1] if href_after else None,
-        )
+        logger.info("pagination: advanced to page=%s", num_after)
         return True
     return False
-
 
 def click_next_page(driver: WebDriver) -> bool:
     """Click the pagination 'next' button.
@@ -1269,6 +1210,7 @@ def extract_contacts(driver: WebDriver) -> list[ContactInfo]:
 
 # Sentinel returned by _parse_current_tab when the session got kicked.
 SESSION_LOST = object()
+SUSPENDED_COMPANY = object()
 
 # Single-pass JS extractor — pulls every field we want in ONE CDP round-trip.
 # This is the biggest perf lever on a remote (Windows) machine where each
@@ -1276,6 +1218,7 @@ SESSION_LOST = object()
 # extractors did ~30–50 round-trips per detail tab, ≈3 s per company in
 # pure overhead. With this one call we cut the per-company budget by
 # roughly a factor of 2–3.
+
 _EXTRACT_JS = r"""
 return (function() {
     const out = {
@@ -1283,23 +1226,20 @@ return (function() {
         website: '', main_business: '', sea_freight: '', air_freight: '',
         contacts: [], is_suspended: false, logged_out: false, ready: false,
     };
-    // Logged-out: visible "SIGN IN" button => server is rendering masked data
+
+    // Kiểm tra: Nếu chưa có thẻ main, báo chưa ready (Python sẽ thử lại)
+    const mainEl = document.querySelector('main');
+    if (!mainEl) return out;
+
+    // Kiểm tra đăng nhập
     const loginBtn = Array.from(document.querySelectorAll('button.login-btn'))
         .find(b => b.offsetParent !== null);
     if (loginBtn) { out.logged_out = true; return out; }
 
-    const mainEl = document.querySelector('main') || document.body;
-    const mainText = (mainEl.innerText || '').toLowerCase();
-    if (mainText.includes('it is not a jctrans member')
-        || mainText.includes('membership suspend')) {
-        out.is_suspended = true;
-        return out;
-    }
-
-    // Company name: first <p> with both font-bold + break-word in main
-    const nameEls = mainEl.querySelectorAll(
-        'p[class*="font-bold"][class*="break-word"]'
-    );
+    // 1. Lấy tên công ty TRƯỚC khi quyết định Suspended.
+    // (Trước đây check Suspended bằng substring trên mainEl.innerText -> false-positive
+    //  khi FAQ / help / footer trong main có chữ "membership suspend".)
+    const nameEls = mainEl.querySelectorAll('p[class*="font-bold"][class*="break-word"]');
     for (const el of nameEls) {
         const t = (el.innerText || '').trim();
         if (t) { out.company_name = t; break; }
@@ -1308,20 +1248,52 @@ return (function() {
         const h1 = document.querySelector('h1');
         if (h1) out.company_name = (h1.innerText || '').trim();
     }
-    if (!out.company_name) { return out; }
+
+    // Nếu chưa có tên, coi như chưa load xong nội dung chính -> Python sẽ poll lại
+    if (!out.company_name) return out;
+
+    // Kiểm tra Suspended/Non-member bằng cách quét element LÁ trong <main>
+    // và yêu cầu textContent ĐÚNG BẰNG (hoặc gần đúng) các cụm trigger
+    // (badge đỏ đứng riêng trên trang thật là 1 element lá).
+    const TRIGGERS = [
+        'it is not a jctrans member',
+        'membership suspend',
+        'membership suspended',
+        'membership has been suspended',
+    ];
+    (function() {
+        const all = mainEl.querySelectorAll('*');
+        for (const el of all) {
+            if (el.children.length > 0) continue;          // chỉ leaf
+            if (el.offsetParent === null) continue;        // bỏ element ẩn
+            const raw = (el.textContent || '').trim();
+            if (!raw) continue;
+            // strip dấu câu / nhiều khoảng trắng
+            const t = raw.toLowerCase()
+                .replace(/[.!?,;:'"`]/g, '')
+                .replace(/\s+/g, ' ')
+                .trim();
+            for (const trig of TRIGGERS) {
+                if (t === trig) {
+                    out.is_suspended = true;
+                    out.suspend_reason = raw.substring(0, 200);
+                    return;
+                }
+            }
+        }
+    })();
+    if (out.is_suspended) { out.ready = true; return out; }
+
     out.ready = true;
 
-    // Member ID — find an element whose text contains "Member ID" and
-    // grab the next <b> in document order.
+    // 2. Lấy Member ID
     (function() {
         const all = mainEl.querySelectorAll('*');
         for (const el of all) {
             if (el.children.length > 8) continue;
             const t = (el.textContent || '').trim().toLowerCase();
             if (!t.includes('member id')) continue;
-            const walker = document.createTreeWalker(
-                mainEl, NodeFilter.SHOW_ELEMENT, null
-            );
+            const walker = document.createTreeWalker(mainEl, NodeFilter.SHOW_ELEMENT, null);
             walker.currentNode = el;
             let n = walker.nextNode();
             let safety = 60;
@@ -1338,25 +1310,21 @@ return (function() {
         }
     })();
 
-    // Year (e.g. "15-Year")
-    {
-        const re = /(\d+\s*-\s*Year)/i;
-        const spans = mainEl.querySelectorAll('span');
-        for (const s of spans) {
-            const m = (s.innerText || '').match(re);
-            if (m) { out.year = m[1]; break; }
-        }
+    // 3. Lấy năm
+    const re = /(\d+\s*-\s*Year)/i;
+    const spans = mainEl.querySelectorAll('span');
+    for (const s of spans) {
+        const m = (s.innerText || '').match(re);
+        if (m) { out.year = m[1]; break; }
     }
 
-    // desc-box label/value pair (Location, Website, ...)
+    // 4. Lấy Location, Website
     function descBoxPair(label) {
         const ps = mainEl.querySelectorAll('p[class*="desc-box"]');
         for (const p of ps) {
             if ((p.innerText || '').trim() === label) {
                 const sib = p.nextElementSibling;
-                if (sib && sib.tagName === 'P') {
-                    return (sib.innerText || '').trim();
-                }
+                if (sib && sib.tagName === 'P') return (sib.innerText || '').trim();
             }
         }
         return '';
@@ -1364,7 +1332,7 @@ return (function() {
     out.location = descBoxPair('Location') || descBoxPair('Country/Region');
     out.website = descBoxPair('Website');
 
-    // Chips block: heading element → ancestor with .normal-boxShadow → chips
+    // 5. Lấy Business/Freight chips
     function chipsForHeading(heading) {
         const all = mainEl.querySelectorAll('*');
         for (const h of all) {
@@ -1372,23 +1340,18 @@ return (function() {
             if ((h.innerText || '').trim() !== heading) continue;
             let box = h;
             while (box) {
-                const cls = (typeof box.className === 'string')
-                    ? box.className : '';
+                const cls = (typeof box.className === 'string') ? box.className : '';
                 if (cls.includes('normal-boxShadow')) break;
                 box = box.parentElement;
             }
             if (!box) continue;
-            const chipEls = box.querySelectorAll(
-                'div[class*="px-4"][class*="py-2"][class*="rounded"]'
-            );
+            const chipEls = box.querySelectorAll('div[class*="px-4"][class*="py-2"][class*="rounded"]');
             const chips = []; const seen = new Set();
             for (const c of chipEls) {
                 const txt = (c.innerText || '').trim();
                 if (!txt) continue;
                 const first = txt.split('\n')[0].trim();
-                if (first && !seen.has(first)) {
-                    seen.add(first); chips.push(first);
-                }
+                if (first && !seen.has(first)) { seen.add(first); chips.push(first); }
             }
             if (chips.length) return chips.join(' | ');
         }
@@ -1398,68 +1361,64 @@ return (function() {
     out.sea_freight = chipsForHeading('Sea Freight Advantageous');
     out.air_freight = chipsForHeading('Air Freight Advantageous');
 
-    // Contacts — one entry per .contactCard
+    // 6. Lấy thông tin liên hệ
     const cards = document.querySelectorAll('div.contactCard');
     for (const card of cards) {
-        const ci = {
-            name: '', position: '', email: '', phone: '',
-            wechat: '', whatsapp: '', skype: '',
-        };
+        const ci = { name: '', position: '', email: '', phone: '', wechat: '', whatsapp: '', skype: '' };
         const nameEl = card.querySelector('.im-info-box');
         if (nameEl) {
             const t = (nameEl.innerText || '').trim();
             if (t) ci.name = t.split('\n')[0].trim();
-            // Position = first sibling DIV after .im-info-box
             let sib = nameEl.nextElementSibling;
             while (sib && sib.tagName !== 'DIV') sib = sib.nextElementSibling;
             if (sib) ci.position = (sib.innerText || '').trim();
         }
-        // Chips: slot-based detection. The contact card has a horizontal
-        // chip container whose direct children are slot wrappers, in this
-        // fixed order: [mail, phone, wechat, whatsapp, skype, ...socials].
-        // Empty slots render as <div><!----></div>. mail/phone use an
-        // <g id="icon/X"> SVG we can sniff directly, but whatsapp/skype use
-        // a different iconfont SVG with no identifier — so we map by slot
-        // index as a fallback.
-        const SLOT_ORDER = ['mail', 'phone', 'wechat', 'whatsapp', 'skype'];
-        let chipContainer = null;
-        const firstChip = card.querySelector(
-            'div.flex.items-center.justify-start[style*="inline-flex"]'
-        );
-        if (firstChip && firstChip.parentElement) {
-            chipContainer = firstChip.parentElement.parentElement;
-        }
-        if (!chipContainer) {
-            chipContainer = card.querySelector(
-                'div.flex.flex-wrap, div[class*="flex-wrap"]'
-            );
-        }
-        if (chipContainer) {
-            const slots = Array.from(chipContainer.children);
-            for (let i = 0; i < slots.length; i++) {
-                const slot = slots[i];
-                const chip = slot.querySelector(
-                    'div.flex.items-center.justify-start, div.flex.items-center'
-                );
-                if (!chip) continue;
-                const contentEl = chip.querySelector('div.content');
-                const value = contentEl ? (contentEl.innerText || '').trim() : '';
-                if (!value) continue;
-                // Prefer the icon id if present, fall back to slot position.
-                const html = chip.innerHTML || '';
-                const m = html.match(/<g\s+id="icon\/([\w\-]+)"/i);
-                let iconType = m ? m[1].toLowerCase() : '';
-                if (!iconType && i < SLOT_ORDER.length) {
-                    iconType = SLOT_ORDER[i];
+        
+        const contentEls = card.querySelectorAll('div.content');
+        for (const contentEl of contentEls) {
+            const value = (contentEl.innerText || '').trim();
+            if (!value) continue;
+            
+            let wrapperHtml = '';
+            if (contentEl.parentElement) {
+                wrapperHtml = (contentEl.parentElement.outerHTML || '').toLowerCase();
+            }
+            
+            const v = value.toLowerCase();
+            let matched = false;
+            
+            if (wrapperHtml.includes('mail') || wrapperHtml.includes('email') || v.includes('@')) {
+                ci.email = value;
+                matched = true;
+            } else if (wrapperHtml.includes('wechat') || wrapperHtml.includes('p-id="2709"') || v.startsWith('wx')) {
+                ci.wechat = value;
+                matched = true;
+            } else if (wrapperHtml.includes('whatsapp') || wrapperHtml.includes('p-id="12863"') || wrapperHtml.includes('whats')) {
+                ci.whatsapp = value;
+                matched = true;
+            } else if (wrapperHtml.includes('skype') || wrapperHtml.includes('live:')) {
+                ci.skype = value;
+                matched = true;
+            } else if (wrapperHtml.includes('phone') || wrapperHtml.includes('tel') || wrapperHtml.includes('mobile')) {
+                ci.phone = value;
+                matched = true;
+            }
+            
+            if (!matched) {
+                if (/[a-z]/i.test(value) && !value.includes('+')) {
+                    if (!ci.wechat) ci.wechat = value;
+                    else ci.skype = value;
+                } else {
+                    if (!ci.phone) ci.phone = value;
+                    else if (!ci.whatsapp) ci.whatsapp = value;
+                    else ci.skype = value;
                 }
-                if (iconType === 'mail') ci.email = value;
-                else if (iconType === 'phone') ci.phone = value;
-                else if (iconType === 'wechat') ci.wechat = value;
-                else if (iconType === 'whatsapp') ci.whatsapp = value;
-                else if (iconType === 'skype') ci.skype = value;
             }
         }
-        if (ci.name || ci.email || ci.phone) out.contacts.push(ci);
+        
+        if (ci.name || ci.email || ci.phone || ci.wechat || ci.whatsapp || ci.skype) {
+            out.contacts.push(ci);
+        }
     }
     return out;
 })();
@@ -1470,20 +1429,11 @@ def _extract_all_via_js(driver: WebDriver) -> dict | None:
     try:
         return driver.execute_script(_EXTRACT_JS)
     except Exception as exc:
-        logger.debug("extract JS failed: %s", exc)
+        logger.error(">>> LỖI JAVASCRIPT: %s", exc)
         return None
-
 
 def _parse_current_tab(driver: WebDriver, country: str, url: str,
                        wait_secs: int = 25):
-    """Parse the detail page that is already loaded in the current tab.
-
-    Returns:
-        CompanyInfo — full data extracted.
-        None        — company is suspended/non-member; skip.
-        SESSION_LOST — the page rendered as logged-out; caller should retry.
-    """
-    # Kick lazy-load (IntersectionObserver) before we start polling.
     try:
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
     except Exception:
@@ -1492,17 +1442,28 @@ def _parse_current_tab(driver: WebDriver, country: str, url: str,
     deadline = time.time() + wait_secs
     data: dict | None = None
     poll = 0.15
+    last_debug = time.time()
+    
     while time.time() < deadline:
         data = _extract_all_via_js(driver)
         if data is None:
             time.sleep(poll)
             continue
+            
+        # --- BÁO CÁO CỤC BỘ MỖI 5 GIÂY ---
+        if time.time() - last_debug > 5:
+            logger.info("   [Debug JS] Dữ liệu thu được: %s", {k: v for k, v in data.items() if k in ['company_name', 'ready', 'is_suspended']})
+            last_debug = time.time()
+            
         if data.get("logged_out"):
             logger.warning("logged out (detected on %s)", url)
             return SESSION_LOST
         if data.get("is_suspended"):
-            logger.info("skip suspended/non-member: %s", url)
-            return None
+            reason = data.get("suspend_reason") or "(no reason captured)"
+            company_dbg = data.get("company_name") or "(no name)"
+            logger.info("!!! Phát hiện Suspended/Non-member: %s | company=%r | trigger=%r",
+                        url, company_dbg, reason)
+            return SUSPENDED_COMPANY # Trả về object đúng để logic bên dưới hiểu
         if data.get("ready"):
             break
         time.sleep(poll)
@@ -1511,18 +1472,14 @@ def _parse_current_tab(driver: WebDriver, country: str, url: str,
         logger.warning("could not parse %s (slow / never finished)", url)
         return None
 
-    # company_name is up — but contactCard lazy-loads via IntersectionObserver
-    # and may take a tick after we scrolled. Quick second-pass for contacts.
     if not data.get("contacts"):
-        for _ in range(10):  # up to ~1.5 s extra
+        for _ in range(10): 
             time.sleep(0.15)
             data2 = _extract_all_via_js(driver)
             if data2 and data2.get("contacts"):
                 data = data2
                 break
             if data2 and data2.get("ready"):
-                # Page is ready, still no contacts — keep waiting in case
-                # IntersectionObserver hasn't fired yet, but stop after the loop.
                 data = data2
 
     info = CompanyInfo(country=country, url=url)
@@ -1546,7 +1503,6 @@ def _parse_current_tab(driver: WebDriver, country: str, url: str,
             skype=c.get("skype") or "",
         ))
     return info
-
 
 def parse_company(driver: WebDriver, country: str, url: str) -> CompanyInfo | None:
     """Visit detail page in the current tab and parse it."""
@@ -1697,72 +1653,55 @@ def _close_extra_tabs(driver: WebDriver, keep_handle: str) -> None:
         pass
 
 
-def _open_urls_in_tabs(driver: WebDriver, urls: list[str], stagger: float = 0.05) -> list[str]:
-    """Open each URL in a new background tab, return the list of new handles in order.
-
-    Uses W3C ``driver.switch_to.new_window('tab')`` instead of ``window.open()``
-    because:
-
-    * It is a WebDriver-level command (CDP), so it bypasses the browser's
-      popup blocker — which is critical when *attached* to a real Edge or
-      Chrome window where ``window.open()`` from a non-user-gesture context
-      is silently blocked.
-    * It is reliable when 20 tabs are opened in rapid succession.
-
-    The tab is navigated using ``location.replace(...)`` (non-blocking) so
-    detail pages load *in parallel* while the caller continues parsing
-    earlier tabs.
-    """
+def _open_urls_in_tabs(driver: WebDriver, urls: list[str], stagger: float = 0.01) -> list[str]:
+    """Open each URL in a new background tab asynchronously using CDP to bypass Selenium wait."""
     main_handle = driver.current_window_handle
+    before_handles = driver.window_handles
     new_handles: list[str] = []
-    before = set(driver.window_handles)
-    for url in urls:
+    
+    logger.info("--- BẮT ĐẦU MỞ %s TAB (Siêu Tốc CDP) ---", len(urls))
+    start_total = time.time()
+    
+    for i, url in enumerate(urls, 1):
+        t0 = time.time()
         try:
-            driver.switch_to.new_window("tab")
-        except Exception as exc:
-            # Fallback to JS open if CDP for some reason isn't available
-            logger.warning("switch_to.new_window failed: %s — falling back to window.open", exc)
+            # Dùng CDP ra lệnh trực tiếp cho Edge mở URL mới. 
+            # Bỏ qua hoàn toàn cơ chế "wait" của Selenium.
             try:
-                driver.switch_to.window(main_handle)
+                driver.execute_cdp_cmd('Target.createTarget', {'url': url})
             except Exception:
-                pass
-            try:
+                # Fallback dự phòng nếu CDP bị lỗi: dùng JS thuần
                 driver.execute_script("window.open(arguments[0], '_blank');", url)
-            except Exception:
-                continue
-            # Find the newly-opened handle
-            for h in driver.window_handles:
-                if h not in before and h not in new_handles:
-                    new_handles.append(h)
-                    break
-            if stagger:
-                time.sleep(stagger)
-            continue
-
-        h = driver.current_window_handle
-        new_handles.append(h)
-        # Navigate without blocking selenium — let the page load in the
-        # background while we keep opening more tabs.
-        try:
-            driver.execute_script(
-                "window.location.replace(arguments[0]);", url
-            )
-        except Exception:
-            try:
-                driver.get(url)
-            except Exception:
-                pass
-        if stagger:
+                
+            t1 = time.time()
+            logger.info("[Tab %02d] Đã bắn URL thành công: %s (Mất: %.3fs)", i, url, t1 - t0)
+            
+        except Exception as exc:
+            logger.warning("[Tab %02d] Mở tab thất bại: %s - Lỗi: %s", i, url, exc)
+            
+        if stagger > 0:
             time.sleep(stagger)
-    # Always end on the main results tab
+            
+    # Chờ 0.5s để trình duyệt kịp cập nhật danh sách các tab mới vào bộ nhớ
+    time.sleep(0.5)
+    
+    # Gom lại các tab vừa được sinh ra theo đúng thứ tự
+    current_handles = driver.window_handles
+    for h in current_handles:
+        if h not in before_handles:
+            new_handles.append(h)
+            
+    total_time = time.time() - start_total
+    logger.info("--- HOÀN TẤT MỞ %s TAB TRONG %.2f GIÂY (Trung bình %.3fs/tab) ---", 
+                len(new_handles), total_time, total_time / max(len(new_handles), 1))
+                
+    # Đảm bảo luồng điều khiển vẫn nằm ở tab danh sách chính
     try:
         driver.switch_to.window(main_handle)
     except Exception:
         pass
-    if len(new_handles) < len(urls):
-        logger.warning("opened only %s/%s tabs", len(new_handles), len(urls))
+        
     return new_handles
-
 
 def _open_country_results(driver: WebDriver, country: str,
                           email: str, password: str) -> bool:
@@ -1776,209 +1715,170 @@ def _open_country_results(driver: WebDriver, country: str,
     click_search(driver)
     return True
 
-
-def _scrape_page_tabs(driver: WebDriver, country: str, urls: list[str],
+def _scrape_page_tabs(driver: WebDriver, items: list[dict],
                       main_handle: str,
-                      tab_batch: int = 20) -> tuple[list[CompanyInfo], bool]:
-    """Open ``urls`` as tabs (in batches of ``tab_batch``), scrape and close.
-
-    Returns ``(results, session_lost)``. If ``session_lost`` is True, the caller
-    must throw away the partial results, re-login and retry the page.
-    """
+                      tab_batch: int = 20) -> tuple[list[CompanyInfo], bool, bool]:
     results: list[CompanyInfo] = []
     session_lost = False
-    for start in range(0, len(urls), tab_batch):
-        batch = urls[start:start + tab_batch]
-        logger.info("opening %s tabs (%s..%s of %s)",
-                    len(batch), start + 1, start + len(batch), len(urls))
-        new_handles = _open_urls_in_tabs(driver, batch)
-        for h, url in zip(new_handles, batch):
+    found_suspended = False
+    for start in range(0, len(items), tab_batch):
+        batch = items[start:start + tab_batch]
+        urls = [x['url'] for x in batch]
+        logger.info("opening %s tabs (%s..%s of %s)", len(batch), start + 1, start + len(batch), len(items))
+        
+        new_handles = _open_urls_in_tabs(driver, urls)
+        unvisited = batch.copy()
+        
+        for i, h in enumerate(new_handles, 1):
             try:
                 driver.switch_to.window(h)
-            except Exception as exc:
-                logger.warning("could not switch to tab for %s: %s", url, exc)
+                time.sleep(0.1) # Chờ URL trên thanh địa chỉ cập nhật
+            except Exception:
                 continue
+                
+            current_url = driver.current_url
+            matched_item = None
+            
+            # Quét xem tab hiện tại thực chất đang chứa link của công ty nào
+            for item in unvisited:
+                company_id = item['url'].strip('/').split('/')[-1]
+                if company_id in current_url:
+                    matched_item = item
+                    break
+                    
+            if matched_item:
+                unvisited.remove(matched_item)
+                logger.info(">> Đang scrape & đóng tab [%02d/%02d]: %s", i, len(new_handles), matched_item['url'])
+            else:
+                # Tab bị Edge cho vào chế độ ngủ đông (about:blank) 
+                # Lấy 1 công ty chưa ai nhận và ép nó tải!
+                if unvisited:
+                    matched_item = unvisited.pop(0)
+                    logger.info(">> Đang đánh thức tab [%02d/%02d] ép tải: %s", i, len(new_handles), matched_item['url'])
+                    driver.get(matched_item['url'])
+                    try:
+                        WebDriverWait(driver, 10).until(
+                            lambda d: d.execute_script("return document.readyState") == "complete"
+                        )
+                    except: pass
+                    time.sleep(1.5)
+                else:
+                    try: driver.close() 
+                    except: pass
+                    continue
+            
             try:
-                info = _parse_current_tab(driver, country, url)
+                # TRUYỀN ĐÚNG DỮ LIỆU CỦA TAB ĐÓ XUỐNG HÀM PARSE
+                info = _parse_current_tab(driver, matched_item['country'], matched_item['url'])
             except Exception as exc:
-                logger.error("error parsing %s: %s", url, exc)
-                logger.debug(traceback.format_exc())
+                logger.error("Lỗi parse: %s", exc)
                 info = None
             finally:
-                try:
-                    driver.close()
-                except Exception:
-                    pass
+                try: driver.close()
+                except: pass
+            
             if info is SESSION_LOST:
-                logger.warning("session lost on %s — aborting batch", url)
                 session_lost = True
                 continue
-            if info is not None:
+            if info is SUSPENDED_COMPANY:
+                # Không break, chỉ log và bỏ qua
+                logger.warning("Đã xác nhận suspended, bỏ qua...")
+                continue 
+            elif info is not None:
                 results.append(info)
-        # Always end the batch on the results tab
+                
         try:
             driver.switch_to.window(main_handle)
         except Exception:
-            logger.error("results tab vanished while scraping batch — aborting page")
             session_lost = True
             break
-        if session_lost:
+            
+        if session_lost or found_suspended:
             break
-    return results, session_lost
+            
+    return results, session_lost, found_suspended
 
-
-def run_country(driver: WebDriver, country: str, ws, current_index: int,
-                save_every: int = 1, save_callback=None,
-                max_pages: int | None = None,
-                max_companies: int | None = None,
-                use_tabs: bool = True,
-                tab_batch: int = 20) -> int:
-    """Run scrape for a single country, append to ws, return new running index."""
-    logger.info("=== country: %s ===", country)
-    if not use_tabs:
-        return _run_country_serial(
-            driver, country, ws, current_index,
-            save_every=save_every, save_callback=save_callback,
-            max_pages=max_pages, max_companies=max_companies,
+def run_global_list(driver: WebDriver, ws, current_index: int, save_callback, tab_batch: int = 20, start_page: int = 1) -> int:
+    start_url = f"https://www.jctrans.com/en/company-page-{start_page}/" if start_page > 1 else DIRECTORY_URL
+    
+    logger.info("Đang truy cập trang danh sách tổng (Bắt đầu từ Page %s)...", start_page)
+    safe_get(driver, start_url, settle=2)
+    
+    logger.info("Đang chờ dữ liệu card công ty render...")
+    try:
+        WebDriverWait(driver, 20).until(
+            lambda d: bool(d.find_elements(By.CSS_SELECTOR, "main a[href*='/en/company/']"))
         )
-
-    if not _open_country_results(driver, country, LOGIN_EMAIL, LOGIN_PASSWORD):
+        logger.info("Đã thấy danh sách công ty! Bắt đầu quét...")
+    except TimeoutException:
+        logger.warning("Không thấy danh sách công ty load. Bạn kiểm tra lại mạng hoặc xem web có đổi giao diện không nhé.")
         return current_index
 
     main_handle = driver.current_window_handle
-    seen_urls: set[str] = set()  # detail urls already written to Excel
-    companies_done = 0
-    started = time.time()
-    page = 1
-    retries_this_page = 0
-    MAX_RETRIES_PER_PAGE = 2
+    seen_urls: set[str] = set()
+    page = start_page
+    
+    # Biến lưu thời gian bắt đầu
+    t_start_wait = time.time()
+    
     while True:
-        # Always verify session before reading the result list
-        if ensure_logged_in(driver, LOGIN_EMAIL, LOGIN_PASSWORD):
-            logger.info("re-login happened — re-opening results")
-            if not _open_country_results(driver, country, LOGIN_EMAIL, LOGIN_PASSWORD):
-                break
-            main_handle = driver.current_window_handle
-            for _ in range(page - 1):
-                if not click_next_page(driver):
+        # --- CƠ CHẾ CHỜ THÔNG MINH ÉP XUNG ---
+        new_items = []
+        page_items = []
+        
+        # Quét liên tục mỗi 0.2s để chớp thời cơ ngay khi có data, bỏ qua việc chờ web load xong UI
+        for _ in range(50): 
+            page_items = collect_company_data(driver)
+            if page_items:
+                new_items = [x for x in page_items if x['url'] not in seen_urls]
+                if new_items:
                     break
-
-        page_urls = collect_company_urls(driver)
-        if not page_urls:
-            logger.info("country %s page %s: no urls — stop", country, page)
+            time.sleep(0.2)
+            
+        t_data_loaded = time.time()
+        if page > start_page:
+            logger.info(">>> [ĐO THỜI GIAN] Từ lúc bấm lật trang xong đến khi bắt được %s URL mới: %.2f giây", len(new_items), t_data_loaded - t_start_wait)
+        
+        if not page_items:
+            logger.warning("Không tìm thấy card công ty nào ở Page %s sau 10s chờ. Dừng script.", page)
             break
-        # Filter out urls we've already scraped (in case of a retry)
-        page_urls = [u for u in page_urls if u not in seen_urls]
-        if not page_urls:
-            logger.info("country %s page %s: all urls already done", country, page)
+            
+        if not new_items:
+            old_urls = [x['url'].split('/')[-2] for x in page_items]
+            logger.info("Page %s: Toàn URL cũ đã scrape. Danh sách đang thấy: %s", page, old_urls[:5])
         else:
-            if max_companies:
-                remaining = max_companies - companies_done
-                if remaining <= 0:
-                    break
-                page_urls = page_urls[:remaining]
-            logger.info("country %s page %s: %s urls", country, page, len(page_urls))
-
-            infos, session_lost = _scrape_page_tabs(
-                driver, country, page_urls, main_handle, tab_batch=tab_batch,
+            infos, session_lost, found_suspended = _scrape_page_tabs(
+                driver, new_items, main_handle, tab_batch=tab_batch,
             )
-
-            if main_handle not in driver.window_handles:
-                logger.error("main results tab closed — aborting country")
-                break
-
+            
             if session_lost:
-                _close_extra_tabs(driver, main_handle)
-                if retries_this_page >= MAX_RETRIES_PER_PAGE:
-                    logger.error("page %s exhausted retries — moving on", page)
-                else:
-                    retries_this_page += 1
-                    logger.warning(
-                        "session lost on page %s — re-login + retry (%s/%s)",
-                        page, retries_this_page, MAX_RETRIES_PER_PAGE,
-                    )
-                    ensure_logged_in(driver, LOGIN_EMAIL, LOGIN_PASSWORD,
-                                     navigate_first=True)
-                    if not _open_country_results(driver, country,
-                                                  LOGIN_EMAIL, LOGIN_PASSWORD):
-                        break
-                    main_handle = driver.current_window_handle
-                    for _ in range(page - 1):
-                        if not click_next_page(driver):
-                            break
-                    continue  # retry same page
-
-            # Successful batch: write results + remember scraped urls
-            retries_this_page = 0
+                logger.error("Session lost — aborting")
+                break
+                
             for info in infos:
                 current_index = append_company_rows(ws, current_index, info)
                 seen_urls.add(info.url)
-                companies_done += 1
-                if save_callback and companies_done % save_every == 0:
-                    save_callback()
-
-        if max_companies and companies_done >= max_companies:
-            logger.info("max_companies hit (%s) — stop", max_companies)
-            break
-        if max_pages and page >= max_pages:
-            logger.info("max_pages hit (%s) — stop", max_pages)
-            break
+                
+            if page % 5 == 0:
+                logger.info("Đang lưu Data vào Excel (Page %s)...", page)
+                save_callback()
+            
+            if found_suspended:
+                logger.info(">>> Phát hiện công ty SUSPEND/NON-MEMBER. Kết thúc quá trình Scrape toàn bộ.")
+                break
+                
         _close_extra_tabs(driver, main_handle)
+        
+        # Đo thời gian click next
+        t_before_click = time.time()
         if not click_next_page(driver):
             break
+        
+        t_start_wait = time.time()
+        logger.info(">>> [ĐO THỜI GIAN] Thao tác hoàn tất đóng tab & Click Next tốn: %.2f giây", t_start_wait - t_before_click)
         page += 1
-
-    elapsed = time.time() - started
-    if companies_done:
-        logger.info(
-            "country %s: %s scraped in %.1fs (%.1fs/company)",
-            country, companies_done, elapsed, elapsed / companies_done,
-        )
+        
     return current_index
-
-
-def _run_country_serial(driver: WebDriver, country: str, ws, current_index: int,
-                        save_every: int = 1, save_callback=None,
-                        max_pages: int | None = None,
-                        max_companies: int | None = None) -> int:
-    """Legacy single-tab flow: collect all URLs then visit one-by-one.
-    Kept as a fallback via --no-tabs in case the tabbed flow hits issues.
-    """
-    urls = collect_all_urls_for_country(
-        driver, country, max_pages=max_pages, max_urls=max_companies,
-    )
-    logger.info("country %s: %s company urls to visit", country, len(urls))
-    if not urls:
-        return current_index
-    if max_companies:
-        urls = urls[:max_companies]
-        logger.info("max_companies cap: %s", len(urls))
-
-    companies_done = 0
-    started = time.time()
-    for i, url in enumerate(urls, 1):
-        logger.info("  [%s/%s] %s", i, len(urls), url)
-        try:
-            info = parse_company(driver, country, url)
-        except Exception as exc:
-            logger.error("error parsing %s: %s", url, exc)
-            logger.debug(traceback.format_exc())
-            continue
-        if info is None:
-            continue
-        current_index = append_company_rows(ws, current_index, info)
-        companies_done += 1
-        if save_callback and companies_done % save_every == 0:
-            save_callback()
-
-    elapsed = time.time() - started
-    if companies_done:
-        logger.info(
-            "country %s: %s/%s scraped in %.1fs (%.1fs/company)",
-            country, companies_done, len(urls), elapsed, elapsed / companies_done,
-        )
-    return current_index
-
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="JCtrans directory scraper")
@@ -2003,6 +1903,8 @@ def main() -> int:
         ),
     )
     parser.add_argument("--verbose", action="store_true")
+    # KHAI BÁO THÊM LỆNH START-PAGE
+    parser.add_argument("--start-page", type=int, default=1, help="Trang bắt đầu scrape (ví dụ: 70)")
     args = parser.parse_args()
 
     setup_logging(args.verbose)
@@ -2026,47 +1928,24 @@ def main() -> int:
         save_checkpoint(state)
 
     try:
-        # When attached to user's browser, do not force navigation /
-        # credential fill — just check, and only run login() if SIGN IN is
-        # actually visible (so we don't disturb a working session).
         if attached:
             ensure_logged_in(driver, LOGIN_EMAIL, LOGIN_PASSWORD, navigate_first=True)
         else:
             login(driver, LOGIN_EMAIL, LOGIN_PASSWORD)
 
-        if args.country:
-            countries = args.country
-        else:
-            # Fetch fresh list from the dropdown
-            safe_get(driver, DIRECTORY_URL, settle=4)
-            countries = list_all_countries(driver)
-            logger.info("countries to process: %s", len(countries))
-
-        done = set(state.get("completed_countries", []))
-        current_index = next_row - 1  # last STT used
-        for country in countries:
-            if args.resume and country in done:
-                logger.info("resume: skip %r (already done)", country)
-                continue
-            try:
-                new_index = run_country(
-                    driver, country, ws, current_index + 1,
-                    save_every=1,
-                    save_callback=save,
-                    max_pages=args.max_pages,
-                    max_companies=args.max_companies,
-                    use_tabs=not args.no_tabs,
-                    tab_batch=args.tab_batch,
-                )
-                current_index = new_index - 1
-            except Exception as exc:
-                logger.error("country %s aborted: %s", country, exc)
-                logger.debug(traceback.format_exc())
-            done.add(country)
-            state["completed_countries"] = sorted(done)
+        current_index = next_row - 1
+        try:
+            current_index = run_global_list(
+                driver, ws, current_index,
+                save_callback=save,
+                tab_batch=args.tab_batch,
+                start_page=args.start_page, # Truyền tham số vào đây
+            )
             state["last_updated"] = datetime.now().isoformat(timespec="seconds")
             save()
-            logger.info("country %s done (%s rows total)", country, ws.max_row - 1)
+        except Exception as exc:
+            logger.error("aborted: %s", exc)
+            logger.debug(traceback.format_exc())        
     finally:
         try:
             wb.save(excel_path)
@@ -2082,10 +1961,7 @@ def main() -> int:
             except Exception:
                 pass
         else:
-            # Detach without killing the user's browser
             try:
-                # Best-effort: close every tab we opened, leaving the
-                # browser session alive for the user.
                 main_handle = driver.current_window_handle
                 for h in list(driver.window_handles):
                     if h == main_handle:
@@ -2101,6 +1977,10 @@ def main() -> int:
 
     logger.info("done — wrote %s", excel_path)
     return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
 
 
 if __name__ == "__main__":
