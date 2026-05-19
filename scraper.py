@@ -733,14 +733,11 @@ def click_search(driver: WebDriver) -> None:
 # ──────────────────────────────────────────────────────────────────────────
 
 
-def collect_company_urls(driver: WebDriver) -> list[str]:
-    """Collect company detail URLs from the current results page.
+def _collect_company_urls_once(driver: WebDriver) -> list[str]:
+    """Return the *currently rendered* company URLs in one CDP round-trip.
 
-    Uses a single ``execute_script`` call so the result is plain strings —
-    no WebElement references can go stale between the iteration and the
-    href read. Vue can re-render the list at any time (especially right
-    after we close a big batch of child tabs), which used to crash this
-    function with StaleElementReferenceException.
+    No retry — used both directly (during settle polling) and by the
+    retry wrapper below.
     """
     try:
         result = driver.execute_script(
@@ -777,6 +774,32 @@ def collect_company_urls(driver: WebDriver) -> list[str]:
         except (NoSuchElementException, StaleElementReferenceException):
             continue
     return urls
+
+
+def collect_company_urls(driver: WebDriver, max_wait: float = 12.0,
+                          poll: float = 0.5) -> list[str]:
+    """Collect company detail URLs from the current results page.
+
+    Vue can leave the list momentarily empty between pagination clicks
+    (clear → API call → re-render). We poll up to ``max_wait`` seconds for
+    a non-empty, *stable* card list. ``stable`` here means: two consecutive
+    polls with identical hrefs. If we never see a stable non-empty result,
+    we return whatever the last poll produced (possibly empty).
+    """
+    deadline = time.time() + max_wait
+    prev: list[str] = []
+    last_non_empty: list[str] = []
+    while True:
+        urls = _collect_company_urls_once(driver)
+        if urls:
+            last_non_empty = urls
+            # Two identical, non-empty polls in a row → settled.
+            if prev and prev == urls:
+                return urls
+        prev = urls
+        if time.time() >= deadline:
+            return last_non_empty
+        time.sleep(poll)
 
 
 def _current_page_num(driver: WebDriver) -> str:
@@ -899,32 +922,51 @@ def _click_next_page_inner(driver: WebDriver) -> bool:
         num_before, len(hrefs_before),
     )
 
-    def _advanced(d: WebDriver) -> bool:
-        """Return True only when *both* the page number and the card list
-        have moved forward.
+    # Closure used by `_advanced` to require the post-click card set to be
+    # *stable* across two consecutive polls. Without this we can latch onto
+    # a transient state (cards present briefly, then cleared by Vue while
+    # the API response is still in flight) and declare advance success
+    # while the list is actually empty, causing the loop to think the
+    # country has no more pages.
+    last_seen_set: list[set[str]] = [set()]
 
-        Element UI updates ``el-pager`` immediately on click, but the
-        actual card list comes from an async API call, so the two are not
-        atomic. We must wait until the cards are *different* — otherwise
-        we'll proceed and read stale URLs.
+    def _advanced(d: WebDriver) -> bool:
+        """Return True only when:
+          - the page number advanced (if we know it),
+          - the card list contains at least one valid /en/company/ href that
+            isn't part of the previous page,
+          - *and* the same card set has been observed across two
+            consecutive polls (i.e. Vue has finished re-rendering).
         """
         try:
             new_num = _page_num_int(d)
             new_hrefs = _all_card_hrefs(d)
-            if not new_hrefs:
+            # Cards must be present and all hrefs must be non-empty.
+            if not new_hrefs or any(not h for h in new_hrefs):
+                last_seen_set[0] = set()
                 return False
             new_set = set(new_hrefs)
-            # If we know the page number, demand it advanced.
+            # Page number must have advanced (when both numbers are known).
             if num_before is not None and new_num is not None:
                 if new_num <= num_before:
+                    last_seen_set[0] = set()
                     return False
-            # And demand a real card change (at least one new href).
+            # Card list must actually move forward — at least one fresh
+            # href that wasn't on the previous page.
             if hrefs_before and new_set == hrefs_before:
+                last_seen_set[0] = set()
                 return False
             if hrefs_before and new_set.issubset(hrefs_before):
+                last_seen_set[0] = set()
+                return False
+            # Settle check: the same set must show up on TWO consecutive
+            # polls (~500ms apart). Otherwise Vue is still re-rendering.
+            if last_seen_set[0] != new_set:
+                last_seen_set[0] = new_set
                 return False
             return True
         except StaleElementReferenceException:
+            last_seen_set[0] = set()
             return False
 
     # Click — JS click + always re-find the button (avoid holding a stale ref)
