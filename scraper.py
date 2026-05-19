@@ -189,6 +189,19 @@ def make_driver(browser: str = "chrome", headless: bool = True,
     opts.add_argument("--disable-renderer-backgrounding")
     opts.add_argument("--disable-backgrounding-occluded-windows")
     opts.add_argument("--disable-notifications")
+    # --- Anti-bot fingerprint hardening ---
+    # User observed: with --attach (real Edge session) jctrans serves full data,
+    # but with fresh headless Chrome jctrans starts hiding member data behind
+    # the .ItisNOTMember badge much earlier (page ~6). Most likely jctrans is
+    # fingerprinting the automated-Chromium signals below.
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    try:
+        # Hide the "Chrome is being controlled by automated test software" infobar
+        # and the cdc_* AutomationExtension hooks.
+        opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+        opts.add_experimental_option("useAutomationExtension", False)
+    except Exception:
+        pass
     if block_images:
         opts.add_argument("--blink-settings=imagesEnabled=false")
     opts.add_argument(f"--user-agent={DEFAULT_USER_AGENT}")
@@ -215,6 +228,21 @@ def make_driver(browser: str = "chrome", headless: bool = True,
             opts.binary_location = "/home/ubuntu/.local/bin/google-chrome"
         driver = webdriver.Chrome(options=opts)
     driver.set_page_load_timeout(120)
+
+    # Final stealth pass: scrub navigator.webdriver before any page script
+    # gets a chance to read it. Has to be installed on EVERY new document
+    # (every tab, every navigation) via CDP, not via a one-shot execute_script.
+    try:
+        stealth_js = (
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+            "Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});"
+            "Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});"
+            "window.chrome = window.chrome || { runtime: {} };"
+        )
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": stealth_js})
+    except Exception:
+        pass
+
     return driver
 
 
