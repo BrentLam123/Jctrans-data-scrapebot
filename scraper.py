@@ -1252,41 +1252,11 @@ return (function() {
     // Nếu chưa có tên, coi như chưa load xong nội dung chính -> Python sẽ poll lại
     if (!out.company_name) return out;
 
-    // Kiểm tra Suspended/Non-member bằng cách quét element LÁ trong <main>
-    // và yêu cầu textContent ĐÚNG BẰNG (hoặc gần đúng) các cụm trigger
-    // (badge đỏ đứng riêng trên trang thật là 1 element lá).
-    const TRIGGERS = [
-        'it is not a jctrans member',
-        'membership suspend',
-        'membership suspended',
-        'membership has been suspended',
-    ];
-    (function() {
-        const all = mainEl.querySelectorAll('*');
-        for (const el of all) {
-            if (el.children.length > 0) continue;          // chỉ leaf
-            if (el.offsetParent === null) continue;        // bỏ element ẩn
-            const raw = (el.textContent || '').trim();
-            if (!raw) continue;
-            // strip dấu câu / nhiều khoảng trắng
-            const t = raw.toLowerCase()
-                .replace(/[.!?,;:'"`]/g, '')
-                .replace(/\s+/g, ' ')
-                .trim();
-            for (const trig of TRIGGERS) {
-                if (t === trig) {
-                    out.is_suspended = true;
-                    out.suspend_reason = raw.substring(0, 200);
-                    return;
-                }
-            }
-        }
-    })();
-    if (out.is_suspended) { out.ready = true; return out; }
-
-    out.ready = true;
-
-    // 2. Lấy Member ID
+    // 2. Lấy Member ID NGAY (trước khi check Suspended).
+    //    Quy tắc: page của 1 JCtrans member LUÔN có "Member ID <số>" hiển thị.
+    //    Nếu lấy được member_id -> chắc chắn là member -> KHÔNG flag Suspended
+    //    dù có thấy text "It is NOT a JCtrans member" trong main (có thể là
+    //    tooltip / hidden modal / promo banner ở 1 số session).
     (function() {
         const all = mainEl.querySelectorAll('*');
         for (const el of all) {
@@ -1309,6 +1279,51 @@ return (function() {
             return;
         }
     })();
+
+    // Suspended/Non-member check CHỈ chạy khi KHÔNG có member_id
+    // (member page luôn có Member ID -> nếu đã có thì bỏ qua check này hoàn toàn).
+    if (!out.member_id) {
+        const TRIGGERS = [
+            'it is not a jctrans member',
+            'membership suspend',
+            'membership suspended',
+            'membership has been suspended',
+        ];
+        (function() {
+            const all = mainEl.querySelectorAll('*');
+            for (const el of all) {
+                if (el.children.length > 0) continue;          // chỉ leaf
+                if (el.offsetParent === null) continue;        // bỏ element ẩn
+                const raw = (el.textContent || '').trim();
+                if (!raw) continue;
+                // strip dấu câu / nhiều khoảng trắng
+                const t = raw.toLowerCase()
+                    .replace(/[.!?,;:'"`]/g, '')
+                    .replace(/\s+/g, ' ')
+                    .trim();
+                for (const trig of TRIGGERS) {
+                    if (t === trig) {
+                        out.is_suspended = true;
+                        // Dump ngữ cảnh để Python log gửi mày debug:
+                        // gồm outerHTML element + parent + grandparent (cắt ngắn).
+                        let dbgEl = el;
+                        let pieces = [];
+                        for (let i = 0; i < 3 && dbgEl; i++) {
+                            const html = (dbgEl.outerHTML || '').slice(0, 400);
+                            pieces.push(`[${i}] ${html}`);
+                            dbgEl = dbgEl.parentElement;
+                        }
+                        out.suspend_reason = raw.substring(0, 200);
+                        out.suspend_debug = pieces.join(' || ');
+                        return;
+                    }
+                }
+            }
+        })();
+        if (out.is_suspended) { out.ready = true; return out; }
+    }
+
+    out.ready = true;
 
     // 3. Lấy năm
     const re = /(\d+\s*-\s*Year)/i;
@@ -1461,8 +1476,11 @@ def _parse_current_tab(driver: WebDriver, country: str, url: str,
         if data.get("is_suspended"):
             reason = data.get("suspend_reason") or "(no reason captured)"
             company_dbg = data.get("company_name") or "(no name)"
+            dbg_html = data.get("suspend_debug") or ""
             logger.info("!!! Phát hiện Suspended/Non-member: %s | company=%r | trigger=%r",
                         url, company_dbg, reason)
+            if dbg_html:
+                logger.info("    suspend_debug HTML context: %s", dbg_html[:1200])
             return SUSPENDED_COMPANY # Trả về object đúng để logic bên dưới hiểu
         if data.get("ready"):
             break
